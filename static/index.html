@@ -1,0 +1,963 @@
+﻿<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whisper 逐字稿系統</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #6c8fff;
+      --accent2: #a78bfa;
+      --green: #34d399;
+      --red: #f87171;
+      --yellow: #fbbf24;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --mono: 'JetBrains Mono', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Noto Sans TC', sans-serif;
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse at 0% 0%, rgba(108,143,255,0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 100% 100%, rgba(167,139,250,0.06) 0%, transparent 50%);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      min-height: 100vh;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 28px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      overflow-y: auto;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; flex-shrink: 0;
+    }
+    .logo-text h1 { font-size: 1rem; font-weight: 700; }
+    .logo-text p { font-size: 0.7rem; color: var(--muted); font-family: var(--mono); }
+
+    .section-label {
+      font-size: 0.68rem;
+      font-family: var(--mono);
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    /* upload zone */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: rgba(108,143,255,0.02);
+    }
+    .upload-zone:hover, .upload-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(108,143,255,0.06);
+    }
+    .upload-icon { font-size: 2rem; margin-bottom: 8px; }
+    .upload-zone h3 { font-size: 0.88rem; font-weight: 500; margin-bottom: 4px; }
+    .upload-zone p { font-size: 0.72rem; color: var(--muted); font-family: var(--mono); }
+    #fileInput { display: none; }
+
+    /* file card */
+    .file-card {
+      display: none;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      gap: 10px;
+      align-items: center;
+    }
+    .file-card.show { display: flex; }
+    .file-card-icon { font-size: 1.4rem; }
+    .file-card-info { flex: 1; min-width: 0; }
+    .file-card-name { font-size: 0.82rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-card-size { font-size: 0.7rem; color: var(--muted); font-family: var(--mono); }
+    .file-card-remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1rem; padding: 2px 6px; border-radius: 4px; transition: color 0.2s; }
+    .file-card-remove:hover { color: var(--red); }
+
+    /* settings */
+    .setting-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+    .setting-row label { font-size: 0.75rem; color: var(--muted); }
+    select, textarea {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 8px 12px;
+      font-family: 'Noto Sans TC', sans-serif;
+      font-size: 0.83rem;
+      outline: none;
+      transition: border-color 0.2s;
+      width: 100%;
+    }
+    select:focus, textarea:focus { border-color: var(--accent); }
+    textarea { resize: vertical; line-height: 1.6; }
+    textarea::placeholder { color: var(--muted); font-size: 0.75rem; }
+    .hint { font-size: 0.68rem; color: var(--muted); font-family: var(--mono); margin-top: 3px; }
+
+    .model-hint {
+      font-size: 0.7rem; color: var(--muted); font-family: var(--mono);
+      padding: 6px 10px; background: var(--bg); border-radius: 6px;
+      line-height: 1.5; margin-top: 4px;
+    }
+
+    /* start button */
+    .btn-start {
+      width: 100%; padding: 13px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none; border-radius: 10px;
+      color: white; font-family: 'Noto Sans TC', sans-serif;
+      font-size: 0.95rem; font-weight: 500;
+      cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+      margin-top: auto;
+    }
+    .btn-start:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
+    .btn-start:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn-stop {
+      width: 100%;
+      margin-top: 10px;
+      padding: 11px;
+      background: rgba(248, 113, 113, 0.12);
+      border: 1px solid rgba(248, 113, 113, 0.45);
+      border-radius: 10px;
+      color: #fca5a5;
+      font-family: 'Noto Sans TC', sans-serif;
+      font-size: 0.9rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      display: none;
+    }
+    .btn-stop.show { display: block; }
+    .btn-stop:hover:not(:disabled) { opacity: 0.92; transform: translateY(-1px); }
+    .btn-stop:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* ── Main ── */
+    .main { padding: 28px 32px; display: flex; flex-direction: column; gap: 20px; }
+    .main-header { display: flex; justify-content: space-between; align-items: center; }
+    .main-header h2 { font-size: 1.05rem; font-weight: 500; }
+    .badge {
+      font-size: 0.68rem; font-family: var(--mono);
+      padding: 3px 8px; border-radius: 20px;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
+    }
+    .badge.green { background: rgba(52,211,153,0.1); border-color: rgba(52,211,153,0.3); color: var(--green); }
+    .badge.yellow { background: rgba(251,191,36,0.1); border-color: rgba(251,191,36,0.3); color: var(--yellow); }
+
+    /* progress */
+    .progress-card {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px; padding: 22px;
+    }
+    .progress-card.show { display: block; }
+    .progress-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .progress-title { font-size: 0.88rem; font-weight: 500; }
+    .progress-pct { font-family: var(--mono); font-size: 0.85rem; color: var(--accent); }
+    .progress-track { height: 4px; background: var(--surface2); border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 4px; width: 0%;
+      transition: width 0.5s ease;
+    }
+    .progress-status { font-size: 0.75rem; color: var(--muted); font-family: var(--mono); }
+
+    /* live counter */
+    .live-counter {
+      display: none;
+      margin-top: 14px;
+      background: var(--bg);
+      border-radius: 10px;
+      padding: 14px 18px;
+      display: none;
+      gap: 24px;
+    }
+    .live-counter.show { display: flex; }
+    .counter-item { display: flex; flex-direction: column; gap: 3px; }
+    .counter-label { font-size: 0.65rem; font-family: var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+    .counter-value { font-size: 1.1rem; font-family: var(--mono); color: var(--accent); font-weight: 500; }
+
+    /* error */
+    .error-card {
+      display: none;
+      background: rgba(248,113,113,0.08);
+      border: 1px solid rgba(248,113,113,0.25);
+      border-radius: 12px; padding: 14px 18px;
+      color: var(--red); font-size: 0.85rem;
+    }
+    .error-card.show { display: block; }
+
+    /* stats bar */
+    .stats-bar {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 20px;
+      gap: 28px;
+      align-items: center;
+    }
+    .stats-bar.show { display: flex; }
+    .stat-item { display: flex; flex-direction: column; gap: 2px; }
+    .stat-label { font-size: 0.65rem; font-family: var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .stat-value { font-size: 0.92rem; font-family: var(--mono); color: var(--text); font-weight: 500; }
+    .stat-divider { width: 1px; height: 30px; background: var(--border); }
+
+    /* transcript card */
+    .transcript-card {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px; overflow: hidden;
+    }
+    .transcript-card.show { display: flex; flex-direction: column; }
+    .transcript-toolbar {
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--surface2);
+    }
+    .toolbar-left { display: flex; align-items: center; gap: 8px; }
+    .tab-btn {
+      font-size: 0.78rem; font-family: var(--mono);
+      background: none; border: none; color: var(--muted);
+      cursor: pointer; padding: 5px 10px; border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .tab-btn.active { background: var(--bg); color: var(--text); }
+    .toolbar-right { display: flex; gap: 8px; }
+    .btn-action {
+      font-size: 0.75rem; font-family: var(--mono);
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--muted); padding: 5px 12px; border-radius: 7px;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-action:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-action.highlight { border-color: var(--accent2); color: var(--accent2); }
+    .btn-action.highlight:hover { background: rgba(167,139,250,0.1); }
+
+    .transcript-content {
+      padding: 22px 24px;
+      font-size: 0.97rem; line-height: 2;
+      overflow-y: auto; min-height: 220px; max-height: 480px;
+    }
+    .plain-view.hide { display: none; }
+    .segments-view { display: none; }
+    .segments-view.show { display: block; }
+    .segment-row {
+      display: grid; grid-template-columns: 110px 1fr;
+      gap: 12px; padding: 9px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.86rem;
+    }
+    .segment-row:last-child { border-bottom: none; }
+    .segment-time { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); padding-top: 3px; }
+
+    /* saved files */
+    .saved-card {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .saved-card.show { display: block; }
+    .saved-header {
+      padding: 12px 18px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.85rem; font-weight: 500;
+    }
+    .saved-dir { font-size: 0.7rem; font-family: var(--mono); color: var(--muted); }
+    .saved-list { padding: 12px 18px; display: flex; flex-direction: column; gap: 8px; }
+    .saved-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 12px;
+      background: var(--bg);
+      border-radius: 8px;
+      font-size: 0.82rem; font-family: var(--mono);
+    }
+    .saved-item-icon { font-size: 1rem; }
+    .saved-item-name { flex: 1; color: var(--text); }
+    .saved-item-full { color: var(--green); }
+
+    /* saved files */
+    .empty-state {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      color: var(--muted); gap: 10px; padding: 60px;
+      text-align: center;
+    }
+    .empty-icon { font-size: 2.8rem; opacity: 0.35; }
+    .empty-state p { font-size: 0.85rem; }
+    .empty-state small { font-size: 0.72rem; font-family: var(--mono); }
+
+    @media (max-width: 768px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+      .main { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">🎙️</div>
+      <div class="logo-text">
+        <h1>Whisper 逐字稿</h1>
+        <p>local · offline · free</p>
+      </div>
+    </div>
+
+    <!-- Upload -->
+    <div>
+      <div class="section-label">上傳音訊</div>
+      <div class="upload-zone" id="uploadZone">
+        <div class="upload-icon">📂</div>
+        <h3>拖曳檔案或點擊上傳</h3>
+        <p>MP3 / WAV / M4A / OGG / FLAC</p>
+      </div>
+      <input type="file" id="fileInput" accept="audio/*" />
+    </div>
+
+    <div class="file-card" id="fileCard">
+      <div class="file-card-icon">🎵</div>
+      <div class="file-card-info">
+        <div class="file-card-name" id="cardName">—</div>
+        <div class="file-card-size" id="cardSize">—</div>
+      </div>
+      <button class="file-card-remove" id="removeFile" title="移除">✕</button>
+    </div>
+
+    <!-- Settings -->
+    <div>
+      <div class="section-label">辨識設定</div>
+
+      <div class="setting-row">
+        <label>模型大小</label>
+        <select id="modelSelect">
+          <option value="tiny">Tiny（最快 / ~75MB）</option>
+          <option value="base">Base（快 / ~142MB）</option>
+          <option value="small" selected>Small（推薦 / ~466MB）★</option>
+          <option value="medium">Medium（慢 / ~1.5GB）</option>
+          <option value="large">Large（最慢 / ~3GB）</option>
+        </select>
+        <div class="model-hint" id="modelHint">🎯 Small 模型：推薦使用，速度與準確率的最佳平衡點</div>
+      </div>
+
+      <div class="setting-row">
+        <label>語言</label>
+        <select id="langSelect">
+          <option value="zh">中文（繁體 / 簡體）</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="auto">自動偵測</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <label>每幾分鐘儲存一個 TXT</label>
+        <select id="chunkSelect">
+          <option value="5">每 5 分鐘</option>
+          <option value="10" selected>每 10 分鐘（推薦）</option>
+          <option value="15">每 15 分鐘</option>
+          <option value="30">每 30 分鐘</option>
+          <option value="999">不切段（只存完整版）</option>
+        </select>
+        <div class="hint">辨識完成後自動存到 output 資料夾</div>
+      </div>
+
+      <div class="setting-row">
+        <label>專有名詞提示（選填）</label>
+        <textarea id="promptInput" rows="5"
+          placeholder="輸入錄音背景或專有名詞，可提升辨識準確率。
+
+範例：
+這是人類圖解讀錄音，包含：薦骨、閘門、通道、投射者、情緒權威、輪迴十字、四分人"></textarea>
+        <div class="hint">提示詞越具體，專有名詞辨識越準確</div>
+      </div>
+    </div>
+
+    <button class="btn-start" id="startBtn" disabled>▶ 開始辨識</button>
+    <button class="btn-stop" id="stopBtn" type="button">停止辨識</button>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main class="main">
+    <div class="main-header">
+      <h2>辨識結果</h2>
+      <span class="badge" id="statusBadge">等待上傳</span>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-card" id="progressCard">
+      <div class="progress-top">
+        <span class="progress-title" id="progressTitle">正在處理...</span>
+        <span class="progress-pct" id="progressPct">0%</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-status" id="progressStatus">準備中...</div>
+
+      <!-- Live counters -->
+      <div class="live-counter" id="liveCounter">
+        <div class="counter-item">
+          <div class="counter-label">已辨識字數</div>
+          <div class="counter-value" id="liveWords">—</div>
+        </div>
+        <div class="counter-item">
+          <div class="counter-label">已耗時</div>
+          <div class="counter-value" id="liveTime">0s</div>
+        </div>
+        <div class="counter-item">
+          <div class="counter-label">使用模型</div>
+          <div class="counter-value" id="liveModel">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error -->
+    <div class="error-card" id="errorCard"></div>
+
+    <!-- Stats bar -->
+    <div class="stats-bar" id="statsBar">
+      <div class="stat-item">
+        <div class="stat-label">辨識完成時間</div>
+        <div class="stat-value" id="statTime">—</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <div class="stat-label">總字數</div>
+        <div class="stat-value" id="statWords">—</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <div class="stat-label">音訊長度</div>
+        <div class="stat-value" id="statDuration">—</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <div class="stat-label">偵測語言</div>
+        <div class="stat-value" id="statLang">—</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <div class="stat-label">使用模型</div>
+        <div class="stat-value" id="statModel">—</div>
+      </div>
+    </div>
+
+    <!-- Saved Files -->
+    <div class="saved-card" id="savedCard">
+      <div class="saved-header">
+        <span>📁 已儲存的 TXT 檔案</span>
+        <span class="saved-dir" id="savedDir"></span>
+      </div>
+      <div class="saved-list" id="savedList"></div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="transcript-card" id="transcriptCard">
+      <div class="transcript-toolbar">
+        <div class="toolbar-left">
+          <button class="tab-btn active" id="tabPlain">純文字</button>
+          <button class="tab-btn" id="tabSegments">時間軸</button>
+        </div>
+        <div class="toolbar-right">
+          <button class="btn-action" id="copyBtn">複製</button>
+          <button class="btn-action highlight" id="copyPromptBtn">複製整理用 Prompt</button>
+          <button class="btn-action" id="downloadBtn">下載 .txt</button>
+        </div>
+      </div>
+      <div class="transcript-content">
+        <div class="plain-view" id="plainView"></div>
+        <div class="segments-view" id="segmentsView"></div>
+      </div>
+    </div>
+
+    <!-- Empty State -->
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">🎧</div>
+      <p>上傳音訊檔案並點擊「開始辨識」</p>
+      <small>支援中文、英文、日文等 99 種語言</small>
+    </div>
+  </main>
+</div>
+
+<script>
+  // ── Elements ──
+  const uploadZone    = document.getElementById('uploadZone');
+  const fileInput     = document.getElementById('fileInput');
+  const fileCard      = document.getElementById('fileCard');
+  const cardName      = document.getElementById('cardName');
+  const cardSize      = document.getElementById('cardSize');
+  const removeFile    = document.getElementById('removeFile');
+  const startBtn      = document.getElementById('startBtn');
+  const stopBtn       = document.getElementById('stopBtn');
+  const modelSelect   = document.getElementById('modelSelect');
+  const langSelect    = document.getElementById('langSelect');
+  const promptInput   = document.getElementById('promptInput');
+  const modelHint     = document.getElementById('modelHint');
+
+  const progressCard  = document.getElementById('progressCard');
+  const progressTitle = document.getElementById('progressTitle');
+  const progressPct   = document.getElementById('progressPct');
+  const progressFill  = document.getElementById('progressFill');
+  const progressStatus= document.getElementById('progressStatus');
+  const liveCounter   = document.getElementById('liveCounter');
+  const liveWords     = document.getElementById('liveWords');
+  const liveTime      = document.getElementById('liveTime');
+  const liveModel     = document.getElementById('liveModel');
+
+  const errorCard     = document.getElementById('errorCard');
+  const statsBar      = document.getElementById('statsBar');
+  const statTime      = document.getElementById('statTime');
+  const statWords     = document.getElementById('statWords');
+  const statDuration  = document.getElementById('statDuration');
+  const statLang      = document.getElementById('statLang');
+  const statModel     = document.getElementById('statModel');
+
+  const transcriptCard= document.getElementById('transcriptCard');
+  const plainView     = document.getElementById('plainView');
+  const segmentsView  = document.getElementById('segmentsView');
+  const emptyState    = document.getElementById('emptyState');
+  const statusBadge   = document.getElementById('statusBadge');
+
+  const chunkSelect   = document.getElementById('chunkSelect');
+  const savedCard     = document.getElementById('savedCard');
+  const savedDir      = document.getElementById('savedDir');
+  const savedList     = document.getElementById('savedList');
+  const tabSegments   = document.getElementById('tabSegments');
+  const copyBtn       = document.getElementById('copyBtn');
+  const copyPromptBtn = document.getElementById('copyPromptBtn');
+  const downloadBtn   = document.getElementById('downloadBtn');
+
+  // ── State ──
+  let selectedFile     = null;
+  let currentTranscript= '';
+  let currentSegments  = [];
+  let timerInterval    = null;
+  let pollInterval     = null;
+  let startTimestamp   = 0;
+  let activeJobId      = null;
+  let stopRequested    = false;
+
+  // ── Model hints ──
+  const modelHints = {
+    tiny:   '⚡ Tiny：速度極快，適合快速測試，準確率普通',
+    base:   '⚡ Base：速度快，準確率良好，適合一般內容',
+    small:  '🎯 Small：推薦使用，速度與準確率的最佳平衡點',
+    medium: '🎯 Medium：準確率很高，適合重要內容，速度較慢',
+    large:  '🏆 Large：最高準確率，適合專業用途，速度最慢',
+  };
+  modelSelect.addEventListener('change', () => {
+    modelHint.textContent = modelHints[modelSelect.value];
+  });
+
+  // ── Upload ──
+  uploadZone.addEventListener('click', () => fileInput.click());
+  uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+  uploadZone.addEventListener('drop', e => {
+    e.preventDefault(); uploadZone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+
+  function handleFile(file) {
+    selectedFile = file;
+    cardName.textContent = file.name;
+    cardSize.textContent = formatSize(file.size);
+    fileCard.classList.add('show');
+    startBtn.disabled = false;
+    hideError();
+  }
+
+  removeFile.addEventListener('click', () => {
+    selectedFile = null; fileInput.value = '';
+    fileCard.classList.remove('show'); startBtn.disabled = true;
+  });
+
+  function formatSize(b) {
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(1) + ' MB';
+  }
+
+  function formatDuration(s) {
+    if (!s) return '—';
+    const m = Math.floor(s / 60), sec = Math.round(s % 60);
+    return m > 0 ? `${m} 分 ${sec} 秒` : `${sec} 秒`;
+  }
+
+  function formatElapsedHMS(seconds) {
+    const total = Number(seconds) || 0;
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = Math.floor(total % 60);
+    return `${h} 時 ${m} 分 ${s} 秒`;
+  }
+
+  // ── Tabs ──
+  tabPlain.addEventListener('click', () => {
+    tabPlain.classList.add('active'); tabSegments.classList.remove('active');
+    plainView.classList.remove('hide'); segmentsView.classList.remove('show');
+  });
+  tabSegments.addEventListener('click', () => {
+    tabSegments.classList.add('active'); tabPlain.classList.remove('active');
+    plainView.classList.add('hide'); segmentsView.classList.add('show');
+  });
+
+  // ── Copy & Download ──
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(currentTranscript).then(() => {
+      copyBtn.textContent = '已複製 ✓';
+      setTimeout(() => copyBtn.textContent = '複製', 2000);
+    });
+  });
+
+  copyPromptBtn.addEventListener('click', () => {
+    const prompt = `以下是語音辨識的逐字稿，請幫我：
+1. 斷句分段
+2. 修正明顯的辨識錯誤
+3. 加上適當標點符號
+4. 保留原本說話的語氣
+
+${currentTranscript}`;
+    navigator.clipboard.writeText(prompt).then(() => {
+      copyPromptBtn.textContent = '已複製 ✓';
+      setTimeout(() => copyPromptBtn.textContent = '複製整理用 Prompt', 2000);
+    });
+  });
+
+  downloadBtn.addEventListener('click', () => {
+    const blob = new Blob([currentTranscript], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const base = selectedFile ? selectedFile.name.replace(/\.[^.]+$/, '') : 'transcript';
+    a.download = base + '_逐字稿.txt';
+    a.click();
+  });
+
+  // ── Live timer ──
+  function startLiveTimer(modelName) {
+    startTimestamp = Date.now();
+    liveModel.textContent = modelName;
+    liveWords.textContent = '辨識中...';
+    liveCounter.classList.add('show');
+    timerInterval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTimestamp) / 1000);
+      liveTime.textContent = formatElapsedHMS(elapsed);
+    }, 1000);
+  }
+
+  function stopLiveTimer() {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+
+  function stopJobPolling() {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+
+  async function refreshJobProgress(jobId) {
+    if (!jobId) return;
+    const res = await fetch(`/jobs/${encodeURIComponent(jobId)}`);
+    const payload = await res.json();
+    if (!res.ok || !payload.ok) return;
+
+    const job = payload.job || {};
+    const pct = Math.max(10, Math.min(96, Number(job.progress_percent || 0)));
+    const processed = Number(job.processed_chunks || 0);
+    const total = Number(job.total_chunks || 0);
+    const state = job.state || 'processing';
+    const statusText = total > 0 ? `已完成 ${processed}/${total} 段` : '準備中...';
+
+    if (state === 'cancel_requested') {
+      setProgress(Math.max(pct, 95), '停止中...', '已送出停止請求，等待目前片段完成');
+      setBadge('停止中', 'yellow');
+      return;
+    }
+
+    if (state === 'processing' || state === 'requested') {
+      setProgress(pct, '辨識中...', statusText);
+      setBadge('辨識中', 'yellow');
+    }
+  }
+
+  function startJobPolling(jobId) {
+    stopJobPolling();
+    pollInterval = setInterval(() => {
+      refreshJobProgress(jobId).catch(() => {});
+    }, 10000);
+  }
+
+  function createJobId() {
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    return 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+  }
+
+  function setStopButton(running) {
+    if (running) {
+      stopBtn.classList.add('show');
+      stopBtn.disabled = false;
+      stopBtn.textContent = '停止辨識';
+      return;
+    }
+    stopBtn.classList.remove('show');
+    stopBtn.disabled = false;
+    stopBtn.textContent = '停止辨識';
+  }
+
+  stopBtn.addEventListener('click', async () => {
+    if (!activeJobId || stopRequested) return;
+    stopRequested = true;
+    stopBtn.disabled = true;
+    stopBtn.textContent = '停止請求送出中...';
+    setBadge('停止中', 'yellow');
+    setProgress(95, '停止中...', '已送出停止請求，將在目前片段完成後中止');
+
+    try {
+      const res = await fetch('/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: activeJobId }),
+      });
+      const payload = await res.json();
+      if (!res.ok || (payload && payload.ok === false)) {
+        throw new Error(parseApiError(res, payload));
+      }
+    } catch (e) {
+      stopRequested = false;
+      stopBtn.disabled = false;
+      stopBtn.textContent = '停止辨識';
+      showError('停止請求送出失敗：' + e.message);
+    }
+  });
+
+  function parseApiResult(payload, fallbackModel) {
+    if (payload && payload.ok === true && payload.result && payload.metrics) {
+      return {
+        transcript: payload.result.transcript || '',
+        segments: payload.result.segments || [],
+        cancelled: !!(payload.job && payload.job.cancelled),
+        elapsed_seconds: payload.metrics.elapsed_seconds || 0,
+        audio_duration: payload.metrics.audio_seconds,
+        word_count: payload.metrics.word_count || 0,
+        saved_files: (payload.artifacts && payload.artifacts.saved_files) || [],
+        output_dir: (payload.artifacts && payload.artifacts.output_dir) || '',
+        language: (payload.job && payload.job.language) || '—',
+        model: (payload.job && payload.job.model) || fallbackModel,
+        job_id: (payload.job && payload.job.id) || '',
+        job_prefix: (payload.job && payload.job.job_prefix) || '',
+      };
+    }
+    return {
+      transcript: payload.transcript || '',
+      segments: payload.segments || [],
+      cancelled: !!payload.cancelled,
+      elapsed_seconds: payload.elapsed_seconds || 0,
+      audio_duration: payload.audio_duration,
+      word_count: payload.word_count || 0,
+      saved_files: payload.saved_files || [],
+      output_dir: payload.output_dir || '',
+      language: payload.language || '—',
+      model: fallbackModel,
+      job_id: '',
+      job_prefix: '',
+    };
+  }
+
+  function parseApiError(res, payload) {
+    if (payload && payload.error && payload.error.message) {
+      const code = payload.error.code ? `[${payload.error.code}] ` : '';
+      return code + payload.error.message;
+    }
+    if (payload && payload.error && typeof payload.error === 'string') return payload.error;
+    return `伺服器錯誤 ${res.status}`;
+  }
+
+  // ── Transcribe ──
+  startBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+
+    stopRequested = false;
+    activeJobId = createJobId();
+    hideError();
+    emptyState.style.display = 'none';
+    transcriptCard.classList.remove('show');
+    statsBar.classList.remove('show');
+    savedCard.classList.remove('show');
+    progressCard.classList.add('show');
+    liveCounter.classList.remove('show');
+    startBtn.disabled = true;
+    setStopButton(true);
+    setBadge('上傳中', 'yellow');
+
+    const modelName = modelSelect.value;
+    setProgress(10, '上傳檔案中...', '正在傳送音訊至本地伺服器...');
+
+    const formData = new FormData();
+    formData.append('audio', selectedFile);
+    formData.append('model', modelName);
+    formData.append('language', langSelect.value);
+    formData.append('initial_prompt', promptInput.value.trim());
+    formData.append('chunk_minutes', chunkSelect.value);
+    formData.append('job_id', activeJobId);
+
+    // 真實進度 + 計時器
+    startLiveTimer(modelName);
+    startJobPolling(activeJobId);
+    setBadge('辨識中', 'yellow');
+
+    try {
+      const res = await fetch('/transcribe', { method: 'POST', body: formData });
+      stopJobPolling();
+      stopLiveTimer();
+      setStopButton(false);
+      activeJobId = null;
+      const payload = await res.json();
+
+      if (!res.ok || (payload && payload.ok === false)) {
+        throw new Error(parseApiError(res, payload));
+      }
+
+      setProgress(98, '整理結果...', '即將完成...');
+      const data = parseApiResult(payload, modelName);
+
+      currentTranscript = data.transcript;
+      currentSegments   = data.segments || [];
+      if (data.cancelled) {
+        setProgress(100, '已停止', '辨識已停止，已輸出目前完成的片段');
+      }
+
+      // update live counter final
+      liveWords.textContent = (data.word_count || 0) + ' 字';
+      liveTime.textContent  = formatElapsedHMS(data.elapsed_seconds || 0);
+
+      setProgress(100, '辨識完成！', '');
+
+      setTimeout(() => {
+        progressCard.classList.remove('show');
+
+        // show stats bar
+        statTime.textContent     = formatElapsedHMS(data.elapsed_seconds);
+        statWords.textContent    = (data.word_count || 0) + ' 字';
+        statDuration.textContent = formatDuration(data.audio_duration);
+        statLang.textContent     = data.language || '—';
+        statModel.textContent    = data.model || modelName;
+        statsBar.classList.add('show');
+
+        // show saved files
+        if (data.saved_files && data.saved_files.length > 0) {
+          const prefix = data.job_prefix ? ` | 任務前綴: ${data.job_prefix}` : '';
+          savedDir.textContent = (data.output_dir || '') + prefix;
+          savedList.innerHTML = '';
+          data.saved_files.forEach(fname => {
+            const isFullVersion = fname.includes('完整逐字稿');
+            const item = document.createElement('div');
+            item.className = 'saved-item';
+            item.innerHTML = `
+              <span class="saved-item-icon">${isFullVersion ? '📄' : '📝'}</span>
+              <span class="saved-item-name ${isFullVersion ? 'saved-item-full' : ''}">${fname}</span>
+            `;
+            savedList.appendChild(item);
+          });
+          savedCard.classList.add('show');
+        }
+
+        renderTranscript();
+        transcriptCard.classList.add('show');
+        startBtn.disabled = false;
+        if (data.cancelled) {
+          setBadge('已停止', '');
+          showError('辨識已停止，結果為目前已完成片段');
+        } else {
+          setBadge('完成', 'green');
+        }
+      }, 500);
+
+    } catch (err) {
+      stopJobPolling();
+      stopLiveTimer();
+      setStopButton(false);
+      activeJobId = null;
+      progressCard.classList.remove('show');
+      showError('辨識失敗：' + err.message + '\n\n請確認本地伺服器（app.py）正在運行中。');
+      startBtn.disabled = false;
+      emptyState.style.display = 'flex';
+      setBadge('失敗', '');
+    }
+  });
+
+  function setProgress(pct, title, status) {
+    progressFill.style.width = pct + '%';
+    progressPct.textContent  = Math.round(pct) + '%';
+    progressTitle.textContent= title;
+    progressStatus.textContent = status;
+  }
+
+  function setBadge(text, color) {
+    statusBadge.textContent = text;
+    statusBadge.className = 'badge' + (color ? ' ' + color : '');
+  }
+
+  function renderTranscript() {
+    plainView.textContent = currentTranscript;
+    segmentsView.innerHTML = '';
+    currentSegments.forEach(seg => {
+      const row = document.createElement('div');
+      row.className = 'segment-row';
+      row.innerHTML = `<div class="segment-time">${fmtTime(seg.start)} → ${fmtTime(seg.end)}</div><div>${seg.text}</div>`;
+      segmentsView.appendChild(row);
+    });
+  }
+
+  function fmtTime(s) {
+    const m = Math.floor(s / 60).toString().padStart(2, '0');
+    const sec = Math.floor(s % 60).toString().padStart(2, '0');
+    return `${m}:${sec}`;
+  }
+
+  function showError(msg) { errorCard.textContent = msg; errorCard.classList.add('show'); }
+  function hideError()     { errorCard.classList.remove('show'); }
+</script>
+</body>
+</html>
+

@@ -1,0 +1,27 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Local outputs (may contain sensitive transcripts/audio-derived text)
+output/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
