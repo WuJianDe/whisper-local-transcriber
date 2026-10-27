@@ -16,6 +16,11 @@
   - 底層採用 CTranslate2 加速架構，記憶體佔用減少 50% 以上。
   - **硬體自動偵測**：有 NVIDIA GPU 時自動啟用 `CUDA + float16` 加速；無獨顯時自動啟用 CPU `int8` 量化加速。
   - **內建 PyAV 解碼**：開箱即用，無須額外手動配置系統端 `ffmpeg` 環境變數。
+- 💬 **即時逐字預覽 + 網頁音訊播放校對**
+  - **邊轉邊看**：辨識過程中，即時預覽框會隨時滾動顯示最新轉出的文字與已辨識字數。
+  - **點擊時間軸跳轉播放**：在「時間軸」檢視中點擊任何一行句子，內建播放器會立即跳轉至該秒數播放原音，校對極其方便。
+- 🎬 **雙格式自動匯出（TXT 逐字稿 + SRT 字幕）**
+  - 轉錄完成自動輸出分段/完整 `.txt` 逐字稿，並同步生成含精確時間碼的標準 `.srt` 字幕檔，可直接匯入剪映、Premiere 或 YouTube。
 - 🔇 **Silero VAD 語音活動偵測 + 防幻覺機制**
   - 自動濾除超過 500ms 的空白靜音區段，大幅加快長音訊處理速度。
   - 結合解碼閥值調校與後處理過濾，有效消除傳統 Whisper 在無聲處常見的「謝謝觀看」、「字幕由...提供」等幻覺（Hallucination）與無限重複鬼打牆。
@@ -26,9 +31,11 @@
   - **自動引導詞 + 跨段上下文銜接**：自動帶入台灣繁體標點引導，並將前一段結尾文字（180 字）動態串接為下一段的 `initial_prompt`，確保長篇錄音前後專有名詞一致。
   - **OpenCC (`s2twp`) 轉換**：自動將模型偶爾產出的簡體字與詞彙轉為台灣繁體慣用字。
 - 🖥️ **直覺現代的深色系 Web UI**
-  - 拖曳上傳、即時進度條、已辨識字數（支援中/日/韓字元與英文單字混合統計）與耗時監控。
+  - **記憶設定**：透過瀏覽器自動記住上次選擇的模型、語言、切段設定與專有名詞提示。
+  - **防掉頁狀態復原**：轉錄採背景非阻塞處理，即使不小心重整網頁或關閉分頁，再次開啟會自動接回進度。
   - **秒級即時中止**：逐句（Segment-level）檢查中止訊號，點擊「停止辨識」1～2 秒內立即停下並保留已完成的部分逐字稿。
   - **一鍵 AI 整理**：內建「複製整理用 Prompt」按鈕，一鍵複製帶指令的逐字稿貼至 ChatGPT / Claude / Gemini 進行潤稿分段。
+  - **一鍵開啟輸出目錄**：網頁端提供「📂 開啟 output 資料夾」按鈕，直接在作業系統中彈出檔案總管。
 
 ---
 
@@ -54,12 +61,12 @@
 
 ### 1. 環境需求
 - 作業系統：Windows 10/11、macOS 或 Linux
-- **Python 3.10 或以上版本**（Windows 安裝時請勾選 `Add Python to PATH`）
+- **Python 3.10 或以上版本**（Windows 安裝時請勾選 `Add python.exe to PATH`）
 
-### 2. 一鍵智慧安裝與啟動
+### 2. 一鍵智慧啟動
 
-本專案將「環境檢查、套件安裝、啟動伺服器与自動開啟瀏覽器」整合為單一入口，**只需執行 `start-windows.bat`（或 `./start-mac-linux.sh`）**：
-- **首次執行（或環境缺件）**：自動建立 `venv` 虛擬環境並安裝所有依賴套件，安裝完成後**自動啟動並開啟網頁介面**。
+本專案將「環境檢查、套件安裝、啟動伺服器與自動開啟瀏覽器」整合為單一入口：
+- **首次執行（或環境缺件）**：自動檢查 Python 環境，建立 `venv` 虛擬環境並安裝所有依賴套件，安裝完成後**自動啟動並開啟網頁介面**。
 - **後續執行**：偵測到環境已就緒，**0 秒跳過安裝直接啟動**！
 
 #### Windows
@@ -98,25 +105,28 @@ chmod +x start-mac-linux.sh
 | :---: | :--- | :--- |
 | `GET` | `/` | 載入 Web 操作介面 |
 | `GET` | `/models` | 取得支援的模型目錄清單 |
-| `POST` | `/transcribe` | 上傳音訊並執行轉錄（`multipart/form-data`：`audio`, `model`, `language`, `chunk_minutes`, `initial_prompt`, `job_id`） |
-| `GET` | `/jobs/<job_id>` | 查詢指定任務的即時進度、已處理段數、耗時與字數 |
+| `POST` | `/transcribe` | 上傳音訊並執行轉錄（支援 `async=1` 背景異步任務） |
+| `GET` | `/jobs/<job_id>` | 查詢指定任務的即時進度、已處理段數、耗時、即時預覽與字數 |
+| `GET` | `/jobs/active` | 取得目前正在執行中的任務狀態（用於頁面重整復原） |
 | `POST` | `/cancel` | 傳入 `{"job_id": "..."}` 請求中止正在執行的任務 |
-| `GET` | `/outputs/<filename>` | 下載 `output/` 資料夾內產生的 `.txt` 逐字稿檔案 |
+| `GET` | `/outputs/<filename>` | 下載 `output/` 資料夾內產生的 `.txt` 逐字稿或 `.srt` 字幕檔案 |
+| `POST` | `/open-output-folder` | 呼叫本機系統檔案總管直接開啟 `output/` 目錄 |
 
 ---
 
 ## ⚙️ 環境變數設定
 
-預設僅綁定本機 `127.0.0.1:5000` 以確保安全性。如需開放區網內其他裝置存取或變更連接埠，可透過環境變數調整：
+預設僅綁定本機 `127.0.0.1:5000` 以確保安全性。如需開放區網內其他裝置存取、變更連接埠或關閉自動開啟瀏覽器，可透過環境變數調整：
 
 ```bash
 # Windows (PowerShell)
 $env:WHISPER_HOST="0.0.0.0"
 $env:WHISPER_PORT="8080"
-python app.py
+$env:WHISPER_NO_BROWSER="1"
+.\venv\Scripts\python.exe app.py
 
 # macOS / Linux
-WHISPER_HOST=0.0.0.0 WHISPER_PORT=8080 python3 app.py
+WHISPER_HOST=0.0.0.0 WHISPER_PORT=8080 WHISPER_NO_BROWSER=1 ./venv/bin/python app.py
 ```
 
 ---
@@ -125,17 +135,18 @@ WHISPER_HOST=0.0.0.0 WHISPER_PORT=8080 python3 app.py
 
 ```text
 whisper-local-transcriber/
-├── app.py               # Flask 後端服務、faster-whisper 轉譯核心、智慧靜音切段與防幻覺處理
+├── app.py               # Flask 後端服務、faster-whisper 轉譯核心、智慧切段、防幻覺與 SRT 產生
 ├── requirements.txt     # Python 依賴套件清單 (faster-whisper, opencc, flask)
 ├── static/
-│   └── index.html       # 單頁式深色系 Web 前端介面
+│   └── index.html       # 單頁式深色系 Web 前端介面（含播放器、即時預覽、字幕下載）
 ├── tests/
 │   └── test_app.py      # Pytest 自動化單元測試
-├── output/              # 轉錄產出的分段與完整 TXT 存放目錄 (已加入 .gitignore)
-└── start-windows.bat / start-mac-linux.sh      # 智慧一鍵安裝與啟動腳本（自動偵測環境、安裝依賴並開啟瀏覽器）
+├── output/              # 轉錄產出的分段與完整 TXT / SRT 存放目錄 (已加入 .gitignore)
+├── start-windows.bat    # Windows 智慧一鍵安裝與啟動腳本
+└── start-mac-linux.sh   # macOS / Linux 智慧一鍵安裝與啟動腳本
 ```
 
 執行單元測試：
 ```bash
-pytest -q
+.\venv\Scripts\python.exe -m pytest -q
 ```
