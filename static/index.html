@@ -279,8 +279,36 @@
       border-bottom: 1px solid var(--border);
       font-size: 0.86rem;
     }
+    .segment-row { cursor: pointer; border-radius: 6px; padding: 9px 8px; transition: background 0.15s; }
+    .segment-row:hover { background: rgba(108,143,255,0.08); }
     .segment-row:last-child { border-bottom: none; }
     .segment-time { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); padding-top: 3px; }
+    .audio-player-bar {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 18px;
+      align-items: center;
+      gap: 14px;
+    }
+    .audio-player-bar.show { display: flex; }
+    .audio-player-bar audio { flex: 1; height: 36px; outline: none; }
+    .audio-player-hint { font-size: 0.72rem; font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+    .live-preview-box {
+      display: none;
+      margin-top: 12px;
+      padding: 10px 14px;
+      background: rgba(15, 17, 23, 0.65);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      font-size: 0.82rem;
+      color: var(--text);
+      line-height: 1.6;
+      max-height: 88px;
+      overflow-y: auto;
+    }
+    .live-preview-box.show { display: block; }
 
     /* saved files */
     .saved-card {
@@ -461,6 +489,7 @@
           <div class="counter-value" id="liveModel">—</div>
         </div>
       </div>
+      <div class="live-preview-box" id="livePreviewBox"></div>
     </div>
 
     <!-- Error -->
@@ -494,11 +523,20 @@
       </div>
     </div>
 
+    <!-- Audio Player -->
+    <div class="audio-player-bar" id="audioPlayerBar">
+      <audio id="audioPlayer" controls preload="metadata"></audio>
+      <span class="audio-player-hint">💡 點擊下方「時間軸」任一句即可跳轉播放</span>
+    </div>
+
     <!-- Saved Files -->
     <div class="saved-card" id="savedCard">
       <div class="saved-header">
-        <span>📁 已儲存的 TXT 檔案</span>
-        <span class="saved-dir" id="savedDir"></span>
+        <span>📁 已儲存的檔案（TXT / SRT 字幕）</span>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span class="saved-dir" id="savedDir"></span>
+          <button class="btn-action" id="openFolderBtn" type="button">📂 開啟 output 資料夾</button>
+        </div>
       </div>
       <div class="saved-list" id="savedList"></div>
     </div>
@@ -514,6 +552,7 @@
           <button class="btn-action" id="copyBtn">複製</button>
           <button class="btn-action highlight" id="copyPromptBtn">複製整理用 Prompt</button>
           <button class="btn-action" id="downloadBtn">下載 .txt</button>
+          <button class="btn-action" id="downloadSrtBtn">下載 .srt 字幕</button>
         </div>
       </div>
       <div class="transcript-content">
@@ -574,13 +613,20 @@
   const savedCard     = document.getElementById('savedCard');
   const savedDir      = document.getElementById('savedDir');
   const savedList     = document.getElementById('savedList');
+  const openFolderBtn = document.getElementById('openFolderBtn');
+  const tabPlain      = document.getElementById('tabPlain');
   const tabSegments   = document.getElementById('tabSegments');
   const copyBtn       = document.getElementById('copyBtn');
   const copyPromptBtn = document.getElementById('copyPromptBtn');
   const downloadBtn   = document.getElementById('downloadBtn');
+  const downloadSrtBtn= document.getElementById('downloadSrtBtn');
+  const livePreviewBox= document.getElementById('livePreviewBox');
+  const audioPlayerBar= document.getElementById('audioPlayerBar');
+  const audioPlayer   = document.getElementById('audioPlayer');
 
   // ── State ──
   let selectedFile     = null;
+  let selectedAudioUrl = null;
   let currentTranscript= '';
   let currentSegments  = [];
   let timerInterval    = null;
@@ -589,7 +635,7 @@
   let activeJobId      = null;
   let stopRequested    = false;
 
-  // ── Model hints ──
+  // ── Model hints & LocalStorage persistence ──
   const modelHints = {
     tiny:   '⚡ Tiny：速度極快，適合快速測試，準確率普通',
     base:   '⚡ Base：速度快，準確率良好，適合一般內容',
@@ -598,8 +644,34 @@
     turbo:  '🔥 Turbo (large-v3-turbo)：逼近 Large 的高準確率，但速度快上數倍（強烈推薦）',
     large:  '🏆 Large：最高準確率，適合專業用途，速度最慢',
   };
+
+  function loadSavedSettings() {
+    try {
+      const m = localStorage.getItem('whisper_model');
+      if (m && modelHints[m]) modelSelect.value = m;
+      const l = localStorage.getItem('whisper_lang');
+      if (l) langSelect.value = l;
+      const c = localStorage.getItem('whisper_chunk');
+      if (c) chunkSelect.value = c;
+      const p = localStorage.getItem('whisper_prompt');
+      if (p !== null) promptInput.value = p;
+      modelHint.textContent = modelHints[modelSelect.value] || modelHints.small;
+    } catch (_) {}
+  }
+  loadSavedSettings();
+
   modelSelect.addEventListener('change', () => {
     modelHint.textContent = modelHints[modelSelect.value];
+    try { localStorage.setItem('whisper_model', modelSelect.value); } catch (_) {}
+  });
+  langSelect.addEventListener('change', () => {
+    try { localStorage.setItem('whisper_lang', langSelect.value); } catch (_) {}
+  });
+  chunkSelect.addEventListener('change', () => {
+    try { localStorage.setItem('whisper_chunk', chunkSelect.value); } catch (_) {}
+  });
+  promptInput.addEventListener('input', () => {
+    try { localStorage.setItem('whisper_prompt', promptInput.value); } catch (_) {}
   });
 
   // ── Upload ──
@@ -614,16 +686,27 @@
 
   function handleFile(file) {
     selectedFile = file;
+    if (selectedAudioUrl) URL.revokeObjectURL(selectedAudioUrl);
+    selectedAudioUrl = URL.createObjectURL(file);
+    audioPlayer.src = selectedAudioUrl;
     cardName.textContent = file.name;
     cardSize.textContent = formatSize(file.size);
     fileCard.classList.add('show');
-    startBtn.disabled = false;
+    if (!activeJobId) startBtn.disabled = false;
     hideError();
   }
 
   removeFile.addEventListener('click', () => {
-    selectedFile = null; fileInput.value = '';
-    fileCard.classList.remove('show'); startBtn.disabled = true;
+    selectedFile = null;
+    fileInput.value = '';
+    if (selectedAudioUrl) {
+      URL.revokeObjectURL(selectedAudioUrl);
+      selectedAudioUrl = null;
+    }
+    audioPlayer.removeAttribute('src');
+    audioPlayerBar.classList.remove('show');
+    fileCard.classList.remove('show');
+    startBtn.disabled = true;
   });
 
   function formatSize(b) {
@@ -655,7 +738,7 @@
     plainView.classList.add('hide'); segmentsView.classList.add('show');
   });
 
-  // ── Copy & Download ──
+  // ── Copy, Download TXT / SRT & Open Folder ──
   copyBtn.addEventListener('click', () => {
     navigator.clipboard.writeText(currentTranscript).then(() => {
       copyBtn.textContent = '已複製 ✓';
@@ -686,9 +769,38 @@ ${currentTranscript}`;
     a.click();
   });
 
+  function fmtSrtTimestamp(sec) {
+    const msTotal = Math.max(0, Math.round((Number(sec) || 0) * 1000));
+    const h = String(Math.floor(msTotal / 3600000)).padStart(2, '0');
+    const m = String(Math.floor((msTotal % 3600000) / 60000)).padStart(2, '0');
+    const s = String(Math.floor((msTotal % 60000) / 1000)).padStart(2, '0');
+    const ms = String(msTotal % 1000).padStart(3, '0');
+    return `${h}:${m}:${s},${ms}`;
+  }
+
+  downloadSrtBtn.addEventListener('click', () => {
+    const blocks = currentSegments
+      .filter(seg => seg.text && seg.text.trim())
+      .map((seg, idx) => `${idx + 1}\n${fmtSrtTimestamp(seg.start)} --> ${fmtSrtTimestamp(Math.max(seg.start + 0.1, seg.end))}\n${seg.text.trim()}`);
+    const srtContent = blocks.join('\n\n') + (blocks.length ? '\n' : '');
+    const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const base = selectedFile ? selectedFile.name.replace(/\.[^.]+$/, '') : 'transcript';
+    a.download = base + '_字幕.srt';
+    a.click();
+  });
+
+  openFolderBtn.addEventListener('click', async () => {
+    try {
+      await fetch('/open-output-folder', { method: 'POST' });
+    } catch (_) {}
+  });
+
   // ── Live timer ──
-  function startLiveTimer(modelName) {
-    startTimestamp = Date.now();
+  function startLiveTimer(modelName, initialElapsedSec = 0) {
+    stopLiveTimer();
+    startTimestamp = Date.now() - Math.floor((Number(initialElapsedSec) || 0) * 1000);
     liveModel.textContent = modelName;
     liveWords.textContent = '辨識中...';
     liveCounter.classList.add('show');
@@ -708,6 +820,72 @@ ${currentTranscript}`;
     pollInterval = null;
   }
 
+  function displayFinalResult(payload, fallbackModel) {
+    stopJobPolling();
+    stopLiveTimer();
+    setStopButton(false);
+    activeJobId = null;
+
+    const data = parseApiResult(payload, fallbackModel);
+    currentTranscript = data.transcript;
+    currentSegments   = data.segments || [];
+
+    liveWords.textContent = (data.word_count || 0) + ' 字';
+    liveTime.textContent  = formatElapsedHMS(data.elapsed_seconds || 0);
+    setProgress(100, data.cancelled ? '已停止' : '辨識完成！', '');
+
+    setTimeout(() => {
+      progressCard.classList.remove('show');
+      livePreviewBox.classList.remove('show');
+
+      statTime.textContent     = formatElapsedHMS(data.elapsed_seconds);
+      statWords.textContent    = (data.word_count || 0) + ' 字';
+      statDuration.textContent = formatDuration(data.audio_duration);
+      statLang.textContent     = data.language || '—';
+      statModel.textContent    = data.model || fallbackModel;
+      statsBar.classList.add('show');
+
+      if (selectedAudioUrl) {
+        audioPlayerBar.classList.add('show');
+      }
+
+      if (data.saved_files && data.saved_files.length > 0) {
+        const prefix = data.job_prefix ? ` | 任務前綴: ${data.job_prefix}` : '';
+        savedDir.textContent = (data.output_dir || '') + prefix;
+        savedList.innerHTML = '';
+        data.saved_files.forEach(fname => {
+          const isFullVersion = fname.includes('完整逐字稿') || fname.endsWith('.srt');
+          const item = document.createElement('div');
+          item.className = 'saved-item';
+          const icon = document.createElement('span');
+          icon.className = 'saved-item-icon';
+          icon.textContent = fname.endsWith('.srt') ? '🎬' : (isFullVersion ? '📄' : '📝');
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'saved-item-name' + (isFullVersion ? ' saved-item-full' : '');
+          nameSpan.textContent = fname;
+          const dlLink = document.createElement('a');
+          dlLink.className = 'saved-item-dl';
+          dlLink.href = `/outputs/${encodeURIComponent(fname)}`;
+          dlLink.download = fname;
+          dlLink.textContent = '下載';
+          item.append(icon, nameSpan, dlLink);
+          savedList.appendChild(item);
+        });
+        savedCard.classList.add('show');
+      }
+
+      renderTranscript();
+      transcriptCard.classList.add('show');
+      if (selectedFile) startBtn.disabled = false;
+      if (data.cancelled) {
+        setBadge('已停止', '');
+        showError('辨識已停止，結果為目前已完成片段');
+      } else {
+        setBadge('完成', 'green');
+      }
+    }, 350);
+  }
+
   async function refreshJobProgress(jobId) {
     if (!jobId) return;
     const res = await fetch(`/jobs/${encodeURIComponent(jobId)}`);
@@ -715,26 +893,49 @@ ${currentTranscript}`;
     if (!res.ok || !payload.ok) return;
 
     const job = payload.job || {};
-    const pct = Math.max(10, Math.min(96, Number(job.progress_percent || 0)));
+    const pct = Math.max(8, Math.min(99, Number(job.progress_percent || 0)));
     const processed = Number(job.processed_chunks || 0);
     const total = Number(job.total_chunks || 0);
     const state = job.state || 'processing';
-    const statusText = total > 0 ? `已完成 ${processed}/${total} 段` : '準備中...';
+    const stageMsg = job.stage_message || (total > 0 ? `已完成 ${processed}/${total} 段` : '準備中...');
+
     if (typeof job.word_count === 'number' && job.word_count > 0) {
       liveWords.textContent = `${job.word_count} 字`;
     }
-    if (typeof job.word_count === 'number' && job.word_count > 0) {
-      liveWords.textContent = `${job.word_count} 字`;
+    if (job.partial_transcript) {
+      livePreviewBox.textContent = '💬 即時預覽：' + job.partial_transcript;
+      livePreviewBox.classList.add('show');
+      livePreviewBox.scrollTop = livePreviewBox.scrollHeight;
+    }
+
+    if (state === 'done' || state === 'cancelled') {
+      if (job.final_response) {
+        displayFinalResult(job.final_response, job.model || modelSelect.value);
+      }
+      return;
+    }
+
+    if (state === 'failed') {
+      stopJobPolling();
+      stopLiveTimer();
+      setStopButton(false);
+      activeJobId = null;
+      progressCard.classList.remove('show');
+      const errMsg = (job.error && job.error.message) || '轉錄失敗，請查看伺服器日誌';
+      showError('辨識失敗：' + errMsg);
+      if (selectedFile) startBtn.disabled = false;
+      setBadge('失敗', '');
+      return;
     }
 
     if (state === 'cancel_requested') {
-      setProgress(Math.max(pct, 95), '停止中...', '已送出停止請求，等待目前片段完成');
+      setProgress(Math.max(pct, 95), '停止中...', '已送出停止請求，正在中止...');
       setBadge('停止中', 'yellow');
       return;
     }
 
     if (state === 'processing' || state === 'requested') {
-      setProgress(pct, '辨識中...', statusText);
+      setProgress(pct, '辨識中...', stageMsg);
       setBadge('辨識中', 'yellow');
     }
   }
@@ -743,8 +944,27 @@ ${currentTranscript}`;
     stopJobPolling();
     pollInterval = setInterval(() => {
       refreshJobProgress(jobId).catch(() => {});
-    }, 3000);
+    }, 2000);
   }
+
+  // ── Page Reload Recovery: check if a job is currently running ──
+  async function checkActiveJobOnLoad() {
+    try {
+      const res = await fetch('/jobs/active');
+      const payload = await res.json();
+      if (!res.ok || !payload.ok || !payload.job) return;
+      const job = payload.job;
+      activeJobId = job.id;
+      emptyState.style.display = 'none';
+      progressCard.classList.add('show');
+      startBtn.disabled = true;
+      setStopButton(true);
+      startLiveTimer(job.model || modelSelect.value, job.elapsed_seconds || 0);
+      await refreshJobProgress(activeJobId);
+      startJobPolling(activeJobId);
+    } catch (_) {}
+  }
+  checkActiveJobOnLoad();
 
   function createJobId() {
     if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
@@ -769,7 +989,7 @@ ${currentTranscript}`;
     stopBtn.disabled = true;
     stopBtn.textContent = '停止請求送出中...';
     setBadge('停止中', 'yellow');
-    setProgress(95, '停止中...', '已送出停止請求，將在目前片段完成後中止');
+    setProgress(95, '停止中...', '已送出停止請求，正在中止...');
 
     try {
       const res = await fetch('/cancel', {
@@ -831,7 +1051,7 @@ ${currentTranscript}`;
     return `伺服器錯誤 ${res.status}`;
   }
 
-  // ── Transcribe ──
+  // ── Transcribe (Non-blocking background job with real-time polling) ──
   startBtn.addEventListener('click', async () => {
     if (!selectedFile) return;
 
@@ -842,6 +1062,9 @@ ${currentTranscript}`;
     transcriptCard.classList.remove('show');
     statsBar.classList.remove('show');
     savedCard.classList.remove('show');
+    audioPlayerBar.classList.remove('show');
+    livePreviewBox.classList.remove('show');
+    livePreviewBox.textContent = '';
     progressCard.classList.add('show');
     liveCounter.classList.remove('show');
     startBtn.disabled = true;
@@ -849,7 +1072,7 @@ ${currentTranscript}`;
     setBadge('上傳中', 'yellow');
 
     const modelName = modelSelect.value;
-    setProgress(10, '上傳檔案中...', '正在傳送音訊至本地伺服器...');
+    setProgress(8, '上傳檔案中...', '正在傳送音訊至本地伺服器...');
 
     const formData = new FormData();
     formData.append('audio', selectedFile);
@@ -858,94 +1081,32 @@ ${currentTranscript}`;
     formData.append('initial_prompt', promptInput.value.trim());
     formData.append('chunk_minutes', chunkSelect.value);
     formData.append('job_id', activeJobId);
+    formData.append('async', '1');
 
-    // 真實進度 + 計時器
-    startLiveTimer(modelName);
-    startJobPolling(activeJobId);
+    startLiveTimer(modelName, 0);
     setBadge('辨識中', 'yellow');
 
     try {
       const res = await fetch('/transcribe', { method: 'POST', body: formData });
-      stopJobPolling();
-      stopLiveTimer();
-      setStopButton(false);
-      activeJobId = null;
       const payload = await res.json();
 
       if (!res.ok || (payload && payload.ok === false)) {
         throw new Error(parseApiError(res, payload));
       }
 
-      setProgress(98, '整理結果...', '即將完成...');
-      const data = parseApiResult(payload, modelName);
-
-      currentTranscript = data.transcript;
-      currentSegments   = data.segments || [];
-      if (data.cancelled) {
-        setProgress(100, '已停止', '辨識已停止，已輸出目前完成的片段');
+      if (payload.async) {
+        await refreshJobProgress(activeJobId);
+        startJobPolling(activeJobId);
+      } else {
+        displayFinalResult(payload, modelName);
       }
-
-      // update live counter final
-      liveWords.textContent = (data.word_count || 0) + ' 字';
-      liveTime.textContent  = formatElapsedHMS(data.elapsed_seconds || 0);
-
-      setProgress(100, '辨識完成！', '');
-
-      setTimeout(() => {
-        progressCard.classList.remove('show');
-
-        // show stats bar
-        statTime.textContent     = formatElapsedHMS(data.elapsed_seconds);
-        statWords.textContent    = (data.word_count || 0) + ' 字';
-        statDuration.textContent = formatDuration(data.audio_duration);
-        statLang.textContent     = data.language || '—';
-        statModel.textContent    = data.model || modelName;
-        statsBar.classList.add('show');
-
-        // show saved files
-        if (data.saved_files && data.saved_files.length > 0) {
-          const prefix = data.job_prefix ? ` | 任務前綴: ${data.job_prefix}` : '';
-          savedDir.textContent = (data.output_dir || '') + prefix;
-          savedList.innerHTML = '';
-          data.saved_files.forEach(fname => {
-            const isFullVersion = fname.includes('完整逐字稿');
-            const item = document.createElement('div');
-            item.className = 'saved-item';
-            const icon = document.createElement('span');
-            icon.className = 'saved-item-icon';
-            icon.textContent = isFullVersion ? '📄' : '📝';
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'saved-item-name' + (isFullVersion ? ' saved-item-full' : '');
-            nameSpan.textContent = fname;
-            const dlLink = document.createElement('a');
-            dlLink.className = 'saved-item-dl';
-            dlLink.href = `/outputs/${encodeURIComponent(fname)}`;
-            dlLink.download = fname;
-            dlLink.textContent = '下載';
-            item.append(icon, nameSpan, dlLink);
-            savedList.appendChild(item);
-          });
-          savedCard.classList.add('show');
-        }
-
-        renderTranscript();
-        transcriptCard.classList.add('show');
-        startBtn.disabled = false;
-        if (data.cancelled) {
-          setBadge('已停止', '');
-          showError('辨識已停止，結果為目前已完成片段');
-        } else {
-          setBadge('完成', 'green');
-        }
-      }, 500);
-
     } catch (err) {
       stopJobPolling();
       stopLiveTimer();
       setStopButton(false);
       activeJobId = null;
       progressCard.classList.remove('show');
-      showError('辨識失敗：' + err.message + '\n\n請確認本地伺服器（app.py）正在運行中。');
+      showError('辨識失敗：' + err.message + '\n\n請確認本地伺服器（start-windows.bat）正在運行中。');
       startBtn.disabled = false;
       emptyState.style.display = 'flex';
       setBadge('失敗', '');
@@ -970,6 +1131,14 @@ ${currentTranscript}`;
     currentSegments.forEach(seg => {
       const row = document.createElement('div');
       row.className = 'segment-row';
+      row.title = '點擊跳轉至此時間點播放';
+      row.addEventListener('click', () => {
+        if (audioPlayer.src) {
+          audioPlayerBar.classList.add('show');
+          audioPlayer.currentTime = Math.max(0, Number(seg.start) || 0);
+          audioPlayer.play().catch(() => {});
+        }
+      });
       const timeDiv = document.createElement('div');
       timeDiv.className = 'segment-time';
       timeDiv.textContent = `${fmtTime(seg.start)} → ${fmtTime(seg.end)}`;
@@ -991,4 +1160,3 @@ ${currentTranscript}`;
 </script>
 </body>
 </html>
-

@@ -28,21 +28,49 @@ if "%NEED_INSTALL%"=="0" (
     )
 )
 
-:: 3. 如需安裝，自動建立 venv 並安裝依賴套件
+:: 3. 如需安裝，自動尋找系統可用的 Python 並建立 venv
 if "%NEED_INSTALL%"=="1" (
     echo [*] 首次執行或缺少依賴套件，正在準備自動安裝...
-    python --version >nul 2>&1
-    if errorlevel 1 (
-        echo [錯誤] 找不到系統 Python！
-        echo 請先安裝 Python 3.10+：https://www.python.org/downloads/
-        echo 安裝時請務必勾選 "Add Python to PATH"。
+    set "SYS_PY="
+
+    python -c "import sys" >nul 2>&1
+    if not errorlevel 1 set "SYS_PY=python"
+
+    if not defined SYS_PY (
+        py -3 -c "import sys" >nul 2>&1
+        if not errorlevel 1 set "SYS_PY=py -3"
+    )
+
+    if not defined SYS_PY (
+        for /d %%D in ("%LocalAppData%\Programs\Python\Python3*") do (
+            if exist "%%D\python.exe" set "SYS_PY="%%D\python.exe""
+        )
+    )
+
+    if not defined SYS_PY (
+        echo.
+        echo [!] 系統尚未安裝可用的 Python 3.10+ 環境（或舊版 Python 已被移除）。
+        where winget >nul 2>&1
+        if not errorlevel 1 (
+            echo [*] 偵測到 Windows 套件管理員 ^(winget^)，正在為您自動下載並安裝 Python 3.12...
+            winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+            for /d %%D in ("%LocalAppData%\Programs\Python\Python3*") do (
+                if exist "%%D\python.exe" set "SYS_PY="%%D\python.exe""
+            )
+        )
+    )
+
+    if not defined SYS_PY (
+        echo [錯誤] 找不到可用的 Python 環境！
+        echo 請前往 https://www.python.org/downloads/ 下載安裝 Python 3.11 或 3.12
+        echo 安裝時請務必勾選底部的 "Add python.exe to PATH"。
         pause
         exit /b 1
     )
 
     if not exist "venv\Scripts\python.exe" (
         echo [*] 正在建立虛擬環境 ^(venv^)...
-        python -m venv venv
+        %SYS_PY% -m venv venv
         if errorlevel 1 (
             echo [錯誤] 虛擬環境建立失敗。
             pause

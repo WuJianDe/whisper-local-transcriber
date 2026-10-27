@@ -2,13 +2,15 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
+import webbrowser
 from datetime import datetime
 from pathlib import Path
-import webbrowser
-from threading import Lock, Timer
+from threading import Lock, Thread, Timer
 
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
@@ -120,6 +122,29 @@ def fmt_time(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}m{secs:02d}s"
+
+
+def fmt_srt_time(seconds: float) -> str:
+    ms_total = max(0, int(round(seconds * 1000)))
+    hours = ms_total // 3_600_000
+    minutes = (ms_total % 3_600_000) // 60_000
+    secs = (ms_total % 60_000) // 1000
+    millis = ms_total % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def build_srt_content(segments: list[dict]) -> str:
+    blocks = []
+    idx = 1
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0.0))
+        end = max(start + 0.1, float(seg.get("end", start + 1.0)))
+        blocks.append(f"{idx}\n{fmt_srt_time(start)} --> {fmt_srt_time(end)}\n{text}")
+        idx += 1
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
 def count_words(text: str) -> int:
@@ -340,6 +365,14 @@ def get_job_snapshot(job_id: str) -> dict | None:
         return dict(job)
 
 
+def get_active_job_snapshot() -> tuple[str, dict] | None:
+    with _jobs_lock:
+        for jid, job in _jobs.items():
+            if job.get("state") in ACTIVE_STATES:
+                return jid, dict(job)
+    return None
+
+
 def try_acquire_job_slot() -> bool:
     global _active_jobs
     with _active_jobs_lock:
@@ -397,7 +430,7 @@ def load_audio_16k(path: str):
 
 class FasterWhisperAdapter:
     """Wraps faster_whisper.WhisperModel to provide a consistent .transcribe() interface
-    with per-segment cancellation check and built-in Silero VAD filtering."""
+    with per-segment cancellation check, intra-chunk progress callback, and Silero VAD."""
 
     is_faster_whisper = True
 
@@ -406,6 +439,7 @@ class FasterWhisperAdapter:
 
     def transcribe(self, audio_chunk, **kwargs):
         job_id = kwargs.get("_job_id", "")
+        on_segment = kwargs.get("_on_segment")
         language = kwargs.get("language")
         initial_prompt = kwargs.get("initial_prompt")
         condition_on_prev = kwargs.get("condition_on_previous_text", False)
@@ -437,13 +471,14 @@ class FasterWhisperAdapter:
         for seg in segments_gen:
             if job_id and is_cancelled(job_id):
                 break
-            collected.append(
-                {
-                    "start": float(getattr(seg, "start", 0.0)),
-                    "end": float(getattr(seg, "end", 0.0)),
-                    "text": getattr(seg, "text", ""),
-                }
-            )
+            item = {
+                "start": float(getattr(seg, "start", 0.0)),
+                "end": float(getattr(seg, "end", 0.0)),
+                "text": getattr(seg, "text", ""),
+            }
+            collected.append(item)
+            if callable(on_segment):
+                on_segment(item)
 
         detected_lang = getattr(info, "language", None) or language or "unknown"
         return {"language": detected_lang, "segments": collected}
@@ -489,141 +524,87 @@ def get_model(model_size: str = DEFAULT_MODEL):
         return model
 
 
-@app.route("/")
-def index():
-    return send_from_directory("static", "index.html")
-
-
-@app.route("/cancel", methods=["POST"])
-def cancel():
-    cleanup_old_jobs()
-    payload = request.get_json(silent=True) or {}
-    job_id = (payload.get("job_id") or request.form.get("job_id") or "").strip()
-    if not job_id:
-        return error_response("MISSING_JOB_ID", "缺少 job_id", 400)
-
-    if not set_cancel(job_id, True):
-        return error_response("JOB_NOT_FOUND", "找不到對應的 job_id", 404, {"job_id": job_id})
-
-    log_event(job_id, "cancel", "cancel requested")
-    return jsonify({"ok": True, "job": {"id": job_id, "cancel_requested": True}})
-
-
-@app.route("/jobs/<job_id>", methods=["GET"])
-def get_job(job_id: str):
-    cleanup_old_jobs()
-    snapshot = get_job_snapshot(job_id)
-    if not snapshot:
-        return error_response("JOB_NOT_FOUND", "找不到對應的 job_id", 404, {"job_id": job_id})
-
+def format_job_status_dict(job_id: str, snapshot: dict) -> dict:
     total_chunks = int(snapshot.get("total_chunks") or 0)
     processed_chunks = int(snapshot.get("processed_chunks") or 0)
+    audio_seconds = float(snapshot.get("audio_seconds") or 0.0)
+    processed_audio_seconds = float(snapshot.get("processed_audio_seconds") or 0.0)
+
     progress_percent = 0.0
-    if total_chunks > 0:
+    if audio_seconds > 0 and processed_audio_seconds > 0:
+        progress_percent = round(min(99.0, (processed_audio_seconds / audio_seconds) * 100), 1)
+    elif total_chunks > 0:
         progress_percent = round(min(100.0, (processed_chunks / total_chunks) * 100), 1)
 
     started_at = snapshot.get("started_at")
     state = snapshot.get("state", "requested")
+    if state in {"done", "cancelled"}:
+        progress_percent = 100.0
+
     if started_at and state in ACTIVE_STATES:
         elapsed = round(max(0.0, time.time() - float(started_at)), 1)
     else:
         elapsed = round(float(snapshot.get("elapsed_seconds") or 0), 1)
 
-    return jsonify(
-        {
-            "ok": True,
-            "job": {
-                "id": job_id,
-                "state": state,
-                "cancel_requested": bool(snapshot.get("cancel_requested", False)),
-                "model": snapshot.get("model"),
-                "language": snapshot.get("language"),
-                "filename": snapshot.get("filename"),
-                "job_prefix": snapshot.get("job_prefix"),
-                "processed_chunks": processed_chunks,
-                "total_chunks": total_chunks,
-                "progress_percent": progress_percent,
-                "elapsed_seconds": elapsed,
-                "word_count": int(snapshot.get("word_count") or 0),
-            },
-        }
-    )
+    payload = {
+        "id": job_id,
+        "state": state,
+        "stage_message": snapshot.get("stage_message") or "",
+        "cancel_requested": bool(snapshot.get("cancel_requested", False)),
+        "cancelled": bool(snapshot.get("cancelled", False)),
+        "model": snapshot.get("model"),
+        "language": snapshot.get("language"),
+        "filename": snapshot.get("filename"),
+        "job_prefix": snapshot.get("job_prefix"),
+        "processed_chunks": processed_chunks,
+        "total_chunks": total_chunks,
+        "progress_percent": progress_percent,
+        "elapsed_seconds": elapsed,
+        "audio_seconds": round(audio_seconds, 1),
+        "word_count": int(snapshot.get("word_count") or 0),
+        "partial_transcript": snapshot.get("partial_transcript") or "",
+    }
+    if snapshot.get("error"):
+        payload["error"] = snapshot["error"]
+    if snapshot.get("final_response"):
+        payload["final_response"] = snapshot["final_response"]
+    return payload
 
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
-    tmp_path = None
-    job_id = ""
-    cleanup_old_jobs()
-
-    if "audio" not in request.files:
-        return error_response("MISSING_AUDIO", "缺少音訊檔欄位 audio", 400)
-
-    file = request.files["audio"]
-    if not file.filename:
-        return error_response("EMPTY_FILENAME", "未選擇檔案", 400)
-    if not allowed_file(file.filename):
-        return error_response("UNSUPPORTED_FILE_TYPE", "不支援的檔案格式", 400)
-
-    model_size = request.form.get("model", DEFAULT_MODEL).strip().lower()
-    language = request.form.get("language", DEFAULT_LANGUAGE).strip().lower()
-    initial_prompt = request.form.get("initial_prompt", "").strip()
-    job_id = (request.form.get("job_id", "") or "").strip() or str(uuid.uuid4())
-    if not JOB_ID_PATTERN.match(job_id):
-        return error_response("INVALID_JOB_ID", "job_id 只允許英數、底線、連字號，最長 64 字", 400)
-    if job_is_active(job_id):
-        return error_response("JOB_ID_IN_USE", "job_id 已有進行中的任務", 409, {"job_id": job_id})
-
-    if model_size not in ALLOWED_MODELS:
-        return error_response("INVALID_MODEL", "model 不在允許清單", 400, {"allowed": sorted(ALLOWED_MODELS)})
-    if language not in ALLOWED_LANGUAGES:
-        return error_response("INVALID_LANGUAGE", "language 不在允許清單", 400, {"allowed": sorted(ALLOWED_LANGUAGES)})
-
-    raw_chunk_minutes = request.form.get("chunk_minutes", str(DEFAULT_CHUNK_MINUTES))
+def run_transcription_pipeline(
+    *,
+    job_id: str,
+    tmp_path: str,
+    original_filename: str,
+    model_size: str,
+    language: str,
+    initial_prompt: str,
+    chunk_minutes: int,
+    job_prefix: str,
+    output_dir: Path,
+    output_dir_view: str,
+) -> dict:
     try:
-        chunk_minutes = parse_chunk_minutes(raw_chunk_minutes)
-    except ValueError as exc:
-        return error_response("INVALID_CHUNK_MINUTES", str(exc), 400)
-
-    if not try_acquire_job_slot():
-        return error_response("BUSY", "目前有進行中的轉錄工作，請稍後再試", 429, {"max_concurrent_jobs": MAX_CONCURRENT_JOBS})
-
-    output_dir = OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_dir_view = output_dir_for_response(output_dir)
-    suffix = Path(file.filename).suffix.lower()
-    job_prefix = build_job_prefix(file.filename)
-
-    create_or_reset_job(job_id, model=model_size, language=language, filename=file.filename)
-    update_job(
-        job_id,
-        state="processing",
-        chunk_minutes=chunk_minutes,
-        processed_chunks=0,
-        total_chunks=0,
-        word_count=0,
-        elapsed_seconds=0.0,
-        job_prefix=job_prefix,
-    )
-    log_event(job_id, "upload-start", f"file={file.filename}, model={model_size}, language={language}, chunk_minutes={chunk_minutes}")
-
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
-
+        update_job(job_id, stage_message="正在解碼音訊檔案...")
         try:
             audio = load_audio_16k(tmp_path)
         except ImportError:
-            update_job(job_id, state="failed", error_code="TRANSCRIBER_UNAVAILABLE")
-            return error_response("TRANSCRIBER_UNAVAILABLE", "音訊解碼器無法載入，請重新安裝依賴", 500)
+            err = {"code": "TRANSCRIBER_UNAVAILABLE", "message": "音訊解碼器無法載入，請重新安裝依賴", "status": 500}
+            update_job(job_id, state="failed", error_code="TRANSCRIBER_UNAVAILABLE", error=err)
+            return {"ok": False, "error": err}
 
+        is_cached = model_size in _model_cache
+        update_job(
+            job_id,
+            stage_message=f"正在載入 {model_size} 模型..." if is_cached else f"正在載入/下載 {model_size} 模型（首次使用需下載權重，請稍候）...",
+        )
         try:
             model = get_model(model_size)
         except RuntimeError as exc:
-            update_job(job_id, state="failed", error_code="MODEL_LOAD_FAILED")
+            err = {"code": "MODEL_LOAD_FAILED", "message": "模型載入失敗，請查看伺服器日誌", "status": 500}
+            update_job(job_id, state="failed", error_code="MODEL_LOAD_FAILED", error=err)
             log_event(job_id, "model-load-fail", str(exc))
-            return error_response("MODEL_LOAD_FAILED", "模型載入失敗，請查看伺服器日誌", 500)
+            return {"ok": False, "error": err}
 
         options = {
             "fp16": use_fp16(),
@@ -651,7 +632,13 @@ def transcribe():
         total_chunks = max(1, len(chunk_ranges))
 
         log_event(job_id, "processing-start", f"audio_seconds={round(total_seconds, 1)}, total_chunks={total_chunks}")
-        update_job(job_id, total_chunks=total_chunks, audio_seconds=round(total_seconds, 1), started_at=start_time)
+        update_job(
+            job_id,
+            total_chunks=total_chunks,
+            audio_seconds=round(total_seconds, 1),
+            started_at=start_time,
+            stage_message=f"辨識中 (共 {total_chunks} 段)...",
+        )
 
         all_segments = []
         transcript_parts = []
@@ -675,13 +662,42 @@ def transcribe():
             if len(chunk_audio) == 0:
                 continue
 
+            stage_label = f"正在辨識第 {chunk_index + 1}/{total_chunks} 段 ({fmt_time(chunk_start_sec)} ~ {fmt_time(chunk_end_sec)})"
+            update_job(job_id, stage_message=stage_label)
             log_event(job_id, "chunk-start", f"{chunk_index + 1}/{total_chunks} {fmt_time(chunk_start_sec)}-{fmt_time(chunk_end_sec)}")
+
             chunk_options = dict(options)
             effective_prompt = build_effective_prompt(language, initial_prompt, context_tail)
             if effective_prompt:
                 chunk_options["initial_prompt"] = effective_prompt
+
+            live_seg_texts = []
+            live_words_delta = 0
+
+            def on_live_segment(seg_item):
+                nonlocal live_words_delta
+                raw_t = (seg_item.get("text") or "").strip()
+                if not raw_t:
+                    return
+                if language == "zh":
+                    raw_t = to_traditional_zh(raw_t)
+                prev_t = live_seg_texts[-1] if live_seg_texts else ""
+                if is_hallucination_or_duplicate(raw_t, prev_t):
+                    return
+                live_seg_texts.append(raw_t)
+                live_words_delta += count_words(raw_t)
+                reached_sec = min(total_seconds, chunk_start_sec + float(seg_item.get("end", 0.0)))
+                preview_parts = transcript_parts + live_seg_texts
+                update_job(
+                    job_id,
+                    processed_audio_seconds=round(reached_sec, 1),
+                    word_count=word_count + live_words_delta,
+                    partial_transcript=" ".join(preview_parts[-40:]),
+                )
+
             if getattr(model, "is_faster_whisper", False):
                 chunk_options["_job_id"] = job_id
+                chunk_options["_on_segment"] = on_live_segment
 
             chunk_result = model.transcribe(chunk_audio, **chunk_options)
             log_event(job_id, "chunk-end", f"{chunk_index + 1}/{total_chunks}")
@@ -704,7 +720,14 @@ def transcribe():
                     word_count += count_words(text)
 
             processed_chunks += 1
-            update_job(job_id, processed_chunks=processed_chunks, elapsed_seconds=round(time.time() - start_time, 1), word_count=word_count)
+            update_job(
+                job_id,
+                processed_chunks=processed_chunks,
+                processed_audio_seconds=round(chunk_end_sec, 1),
+                elapsed_seconds=round(time.time() - start_time, 1),
+                word_count=word_count,
+                partial_transcript=" ".join(transcript_parts[-40:]),
+            )
 
             if write_chunk_files and (chunk_segments or not is_cancelled(job_id)):
                 chunk_filename = save_chunk_txt(
@@ -740,52 +763,203 @@ def transcribe():
         saved_files.append(full_filename)
         log_event(job_id, "save", f"full_file={full_filename}")
 
-        final_state = "cancelled" if cancelled else "done"
-        update_job(job_id, state=final_state, processed_chunks=processed_chunks, word_count=word_count, elapsed_seconds=elapsed)
-        log_event(job_id, "done", f"state={final_state}, elapsed={elapsed}s, words={word_count}")
+        if all_segments:
+            srt_filename = f"{job_prefix}_{'部分字幕' if cancelled else '字幕'}.srt"
+            srt_path = output_dir / srt_filename
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(build_srt_content(all_segments))
+            saved_files.append(srt_filename)
+            log_event(job_id, "save", f"srt_file={srt_filename}")
 
-        return jsonify(
-            {
-                "ok": True,
-                "job": {
-                    "id": job_id,
-                    "cancelled": cancelled,
-                    "state": final_state,
-                    "model": model_size,
-                    "language": detected_language if detected_language != "unknown" else language,
-                    "job_prefix": job_prefix,
-                    "processed_chunks": processed_chunks,
-                    "total_chunks": total_chunks,
-                },
-                "metrics": {
-                    "elapsed_seconds": elapsed,
-                    "audio_seconds": round(total_seconds, 1),
-                    "word_count": word_count,
-                },
-                "result": {
-                    "transcript": full_transcript,
-                    "segments": all_segments,
-                },
-                "artifacts": {
-                    "output_dir": output_dir_view,
-                    "saved_files": saved_files,
-                },
-            }
+        final_state = "cancelled" if cancelled else "done"
+        final_response = {
+            "ok": True,
+            "job": {
+                "id": job_id,
+                "cancelled": cancelled,
+                "state": final_state,
+                "model": model_size,
+                "language": detected_language if detected_language != "unknown" else language,
+                "job_prefix": job_prefix,
+                "processed_chunks": processed_chunks,
+                "total_chunks": total_chunks,
+            },
+            "metrics": {
+                "elapsed_seconds": elapsed,
+                "audio_seconds": round(total_seconds, 1),
+                "word_count": word_count,
+            },
+            "result": {
+                "transcript": full_transcript,
+                "segments": all_segments,
+            },
+            "artifacts": {
+                "output_dir": output_dir_view,
+                "saved_files": saved_files,
+            },
+        }
+        update_job(
+            job_id,
+            state=final_state,
+            cancelled=cancelled,
+            processed_chunks=processed_chunks,
+            word_count=word_count,
+            elapsed_seconds=elapsed,
+            stage_message="已停止" if cancelled else "辨識完成",
+            final_response=final_response,
         )
+        log_event(job_id, "done", f"state={final_state}, elapsed={elapsed}s, words={word_count}")
+        return final_response
 
     except Exception as exc:
-        update_job(job_id, state="failed", error_code="INTERNAL_ERROR")
+        err = {"code": "INTERNAL_ERROR", "message": "轉錄失敗，請查看伺服器日誌", "status": 500}
+        update_job(job_id, state="failed", error_code="INTERNAL_ERROR", error=err)
         log_event(job_id or "-", "fail", f"{type(exc).__name__}: {exc}")
-        return error_response("INTERNAL_ERROR", "轉錄失敗，請查看伺服器日誌", 500)
+        return {"ok": False, "error": err}
     finally:
         release_job_slot()
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.route("/cancel", methods=["POST"])
+def cancel():
+    cleanup_old_jobs()
+    payload = request.get_json(silent=True) or {}
+    job_id = (payload.get("job_id") or request.form.get("job_id") or "").strip()
+    if not job_id:
+        return error_response("MISSING_JOB_ID", "缺少 job_id", 400)
+
+    if not set_cancel(job_id, True):
+        return error_response("JOB_NOT_FOUND", "找不到對應的 job_id", 404, {"job_id": job_id})
+
+    log_event(job_id, "cancel", "cancel requested")
+    return jsonify({"ok": True, "job": {"id": job_id, "cancel_requested": True}})
+
+
+@app.route("/jobs/active", methods=["GET"])
+def get_active_job():
+    cleanup_old_jobs()
+    active = get_active_job_snapshot()
+    if not active:
+        return jsonify({"ok": True, "job": None})
+    job_id, snapshot = active
+    return jsonify({"ok": True, "job": format_job_status_dict(job_id, snapshot)})
+
+
+@app.route("/jobs/<job_id>", methods=["GET"])
+def get_job(job_id: str):
+    cleanup_old_jobs()
+    snapshot = get_job_snapshot(job_id)
+    if not snapshot:
+        return error_response("JOB_NOT_FOUND", "找不到對應的 job_id", 404, {"job_id": job_id})
+    return jsonify({"ok": True, "job": format_job_status_dict(job_id, snapshot)})
+
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    cleanup_old_jobs()
+
+    if "audio" not in request.files:
+        return error_response("MISSING_AUDIO", "缺少音訊檔欄位 audio", 400)
+
+    file = request.files["audio"]
+    if not file.filename:
+        return error_response("EMPTY_FILENAME", "未選擇檔案", 400)
+    if not allowed_file(file.filename):
+        return error_response("UNSUPPORTED_FILE_TYPE", "不支援的檔案格式", 400)
+
+    model_size = request.form.get("model", DEFAULT_MODEL).strip().lower()
+    language = request.form.get("language", DEFAULT_LANGUAGE).strip().lower()
+    initial_prompt = request.form.get("initial_prompt", "").strip()
+    job_id = (request.form.get("job_id", "") or "").strip() or str(uuid.uuid4())
+    async_mode = (request.form.get("async", "") or request.args.get("async", "")).strip().lower() in {"1", "true", "yes"}
+
+    if not JOB_ID_PATTERN.match(job_id):
+        return error_response("INVALID_JOB_ID", "job_id 只允許英數、底線、連字號，最長 64 字", 400)
+    if job_is_active(job_id):
+        return error_response("JOB_ID_IN_USE", "job_id 已有進行中的任務", 409, {"job_id": job_id})
+
+    if model_size not in ALLOWED_MODELS:
+        return error_response("INVALID_MODEL", "model 不在允許清單", 400, {"allowed": sorted(ALLOWED_MODELS)})
+    if language not in ALLOWED_LANGUAGES:
+        return error_response("INVALID_LANGUAGE", "language 不在允許清單", 400, {"allowed": sorted(ALLOWED_LANGUAGES)})
+
+    raw_chunk_minutes = request.form.get("chunk_minutes", str(DEFAULT_CHUNK_MINUTES))
+    try:
+        chunk_minutes = parse_chunk_minutes(raw_chunk_minutes)
+    except ValueError as exc:
+        return error_response("INVALID_CHUNK_MINUTES", str(exc), 400)
+
+    if not try_acquire_job_slot():
+        return error_response("BUSY", "目前有進行中的轉錄工作，請稍後再試", 429, {"max_concurrent_jobs": MAX_CONCURRENT_JOBS})
+
+    output_dir = OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir_view = output_dir_for_response(output_dir)
+    suffix = Path(file.filename).suffix.lower()
+    job_prefix = build_job_prefix(file.filename)
+
+    create_or_reset_job(job_id, model=model_size, language=language, filename=file.filename)
+    update_job(
+        job_id,
+        state="processing",
+        stage_message="已接收檔案，準備開始...",
+        chunk_minutes=chunk_minutes,
+        processed_chunks=0,
+        total_chunks=0,
+        word_count=0,
+        elapsed_seconds=0.0,
+        job_prefix=job_prefix,
+    )
+    log_event(job_id, "upload-start", f"file={file.filename}, model={model_size}, language={language}, chunk_minutes={chunk_minutes}")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            file.save(tmp.name)
+            tmp_path = tmp.name
+    except Exception as exc:
+        release_job_slot()
+        update_job(job_id, state="failed", error_code="UPLOAD_SAVE_FAILED")
+        log_event(job_id, "fail", f"upload save failed: {exc}")
+        return error_response("INTERNAL_ERROR", "儲存上傳暫存檔失敗", 500)
+
+    pipeline_kwargs = {
+        "job_id": job_id,
+        "tmp_path": tmp_path,
+        "original_filename": file.filename,
+        "model_size": model_size,
+        "language": language,
+        "initial_prompt": initial_prompt,
+        "chunk_minutes": chunk_minutes,
+        "job_prefix": job_prefix,
+        "output_dir": output_dir,
+        "output_dir_view": output_dir_view,
+    }
+
+    if async_mode:
+        worker = Thread(target=run_transcription_pipeline, kwargs=pipeline_kwargs, daemon=True)
+        worker.start()
+        return jsonify({"ok": True, "async": True, "job": {"id": job_id, "state": "processing", "job_prefix": job_prefix}}), 202
+
+    outcome = run_transcription_pipeline(**pipeline_kwargs)
+    if not outcome.get("ok"):
+        err = outcome.get("error") or {}
+        return error_response(err.get("code", "INTERNAL_ERROR"), err.get("message", "轉錄失敗"), int(err.get("status", 500)))
+    return jsonify(outcome)
 
 
 @app.route("/outputs/<path:filename>", methods=["GET"])
 def download_output_file(filename: str):
-    if "/" in filename or "\\" in filename or ".." in filename or not filename.endswith(".txt"):
+    if "/" in filename or "\\" in filename or ".." in filename or not (filename.endswith(".txt") or filename.endswith(".srt")):
         return error_response("INVALID_FILENAME", "不合法的檔案名稱", 400)
     target = (OUTPUT_DIR / filename).resolve()
     try:
@@ -795,6 +969,23 @@ def download_output_file(filename: str):
     if not target.is_file():
         return error_response("FILE_NOT_FOUND", "找不到指定的輸出檔案", 404)
     return send_from_directory(str(OUTPUT_DIR.resolve()), filename, as_attachment=True)
+
+
+@app.route("/open-output-folder", methods=["POST"])
+def open_output_folder():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    folder_path = str(OUTPUT_DIR.resolve())
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(folder_path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", folder_path])
+        else:
+            subprocess.Popen(["xdg-open", folder_path])
+        return jsonify({"ok": True, "path": folder_path})
+    except Exception as exc:
+        logger.warning("無法開啟資料夾: %s", exc)
+        return error_response("OPEN_FOLDER_FAILED", "無法自動開啟資料夾，請手動前往 output 目錄", 500)
 
 
 @app.route("/models", methods=["GET"])

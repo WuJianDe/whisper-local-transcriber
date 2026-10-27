@@ -91,9 +91,19 @@ def test_count_words_mixed_cjk_and_english():
     assert whisper_app.count_words("今天開會討論 AI agent 架構") == 9
 
 
+def test_build_srt_content():
+    srt = whisper_app.build_srt_content(
+        [
+            {"start": 0.0, "end": 2.5, "text": "第一句字幕"},
+            {"start": 65.12, "end": 68.0, "text": "第二句字幕"},
+        ]
+    )
+    assert "1\n00:00:00,000 --> 00:00:02,500\n第一句字幕" in srt
+    assert "2\n00:01:05,120 --> 00:01:08,000\n第二句字幕" in srt
+
+
 def test_compute_silence_boundaries_finds_quietest_point():
     sr = 100
-    # 25 seconds of loud signal (1.0), except a quiet valley at 9.0s..9.5s (0.0)
     audio = [1.0] * (25 * sr)
     for i in range(int(9.0 * sr), int(9.5 * sr)):
         audio[i] = 0.0
@@ -134,7 +144,7 @@ def test_parse_chunk_minutes_bounds():
         whisper_app.parse_chunk_minutes("abc")
 
 
-def test_transcribe_success_schema_and_turbo_model(client, monkeypatch):
+def test_transcribe_success_schema_and_srt_generation(client, monkeypatch):
     install_fake_whisper(monkeypatch, seconds=8.0)
     res = client.post("/transcribe", data=make_upload_data(model="turbo"), content_type="multipart/form-data")
     assert res.status_code == 200
@@ -146,8 +156,9 @@ def test_transcribe_success_schema_and_turbo_model(client, monkeypatch):
     assert isinstance(payload["metrics"]["elapsed_seconds"], float)
     assert payload["result"]["transcript"] != ""
     assert payload["artifacts"]["output_dir"] == "output"
-    assert payload["artifacts"]["saved_files"]
-    assert any(re.search(r"_\d{8}_\d{6}_", name) for name in payload["artifacts"]["saved_files"])
+    saved_files = payload["artifacts"]["saved_files"]
+    assert any(name.endswith(".txt") for name in saved_files)
+    assert any(name.endswith(".srt") for name in saved_files)
 
 
 def test_transcribe_context_carryover_and_vad(client, monkeypatch):
@@ -196,17 +207,30 @@ def test_transcribe_rejects_duplicate_active_job_id(client):
     assert res.get_json()["error"]["code"] == "JOB_ID_IN_USE"
 
 
-def test_download_output_file(client, monkeypatch):
+def test_download_output_txt_and_srt_files(client, monkeypatch):
     install_fake_whisper(monkeypatch, seconds=8.0)
     res = client.post("/transcribe", data=make_upload_data(), content_type="multipart/form-data")
-    saved = res.get_json()["artifacts"]["saved_files"][0]
+    saved_files = res.get_json()["artifacts"]["saved_files"]
 
-    dl = client.get(f"/outputs/{saved}")
-    assert dl.status_code == 200
-    assert "測試文字" in dl.get_data(as_text=True)
+    for fname in saved_files:
+        dl = client.get(f"/outputs/{fname}")
+        assert dl.status_code == 200
+        assert "測試文字" in dl.get_data(as_text=True)
 
     bad = client.get("/outputs/..%2Fapp.py")
     assert bad.status_code == 400
+
+
+def test_active_job_endpoint(client):
+    res_empty = client.get("/jobs/active")
+    assert res_empty.status_code == 200
+    assert res_empty.get_json()["job"] is None
+
+    whisper_app.create_or_reset_job("job-running", model="turbo", language="zh", filename="demo.mp3")
+    whisper_app.update_job("job-running", state="processing", processed_chunks=1, total_chunks=4)
+    res_active = client.get("/jobs/active")
+    assert res_active.status_code == 200
+    assert res_active.get_json()["job"]["id"] == "job-running"
 
 
 def test_cancel_endpoint(client):
