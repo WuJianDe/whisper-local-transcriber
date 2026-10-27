@@ -25,3 +25,6 @@ output/
 Thumbs.db
 .vscode/
 .idea/
+
+venv_old/
+
