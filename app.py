@@ -392,7 +392,7 @@ def load_audio_16k(path: str):
 
         return whisper.audio.load_audio(path)
     except ImportError as exc:
-        raise ImportError("無法載入音訊解碼器，請執行 start.bat / start.sh 安裝 faster-whisper") from exc
+        raise ImportError("無法載入音訊解碼器，請執行 start-windows.bat / start-mac-linux.sh 安裝 faster-whisper") from exc
 
 
 class FasterWhisperAdapter:
@@ -476,7 +476,7 @@ def get_model(model_size: str = DEFAULT_MODEL):
         try:
             import whisper
         except ImportError as exc:
-            raise RuntimeError("找不到 faster-whisper 或 whisper，請執行 start.bat / start.sh") from exc
+            raise RuntimeError("找不到 faster-whisper 或 whisper，請執行 start-windows.bat / start-mac-linux.sh") from exc
 
         try:
             logger.info("載入 Whisper 模型: %s ...", model_size)

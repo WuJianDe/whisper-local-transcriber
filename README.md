@@ -58,20 +58,20 @@
 
 ### 2. 一鍵智慧安裝與啟動
 
-本專案將「環境檢查、套件安裝、啟動伺服器与自動開啟瀏覽器」整合為單一入口，**只需執行 `start.bat`（或 `./start.sh`）**：
+本專案將「環境檢查、套件安裝、啟動伺服器与自動開啟瀏覽器」整合為單一入口，**只需執行 `start-windows.bat`（或 `./start-mac-linux.sh`）**：
 - **首次執行（或環境缺件）**：自動建立 `venv` 虛擬環境並安裝所有依賴套件，安裝完成後**自動啟動並開啟網頁介面**。
 - **後續執行**：偵測到環境已就緒，**0 秒跳過安裝直接啟動**！
 
 #### Windows
-直接雙擊執行 **`start.bat`**（或在終端機輸入）：
+直接雙擊執行 **`start-windows.bat`**（或在終端機輸入）：
 ```bat
-start.bat
+start-windows.bat
 ```
 
 #### macOS / Linux
 ```bash
-chmod +x start.sh
-./start.sh
+chmod +x start-mac-linux.sh
+./start-mac-linux.sh
 ```
 
 啟動後系統會自動打開瀏覽器前往 👉 **`http://127.0.0.1:5000`**。
@@ -132,7 +132,7 @@ whisper-local-transcriber/
 ├── tests/
 │   └── test_app.py      # Pytest 自動化單元測試
 ├── output/              # 轉錄產出的分段與完整 TXT 存放目錄 (已加入 .gitignore)
-└── start.bat / .sh      # 智慧一鍵安裝與啟動腳本（自動偵測環境、安裝依賴並開啟瀏覽器）
+└── start-windows.bat / start-mac-linux.sh      # 智慧一鍵安裝與啟動腳本（自動偵測環境、安裝依賴並開啟瀏覽器）
 ```
 
 執行單元測試：
