@@ -7,7 +7,8 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+import webbrowser
+from threading import Lock, Timer
 
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
@@ -391,7 +392,7 @@ def load_audio_16k(path: str):
 
         return whisper.audio.load_audio(path)
     except ImportError as exc:
-        raise ImportError("無法載入音訊解碼器，請先執行 install.bat / install.sh 安裝 faster-whisper") from exc
+        raise ImportError("無法載入音訊解碼器，請執行 start.bat / start.sh 安裝 faster-whisper") from exc
 
 
 class FasterWhisperAdapter:
@@ -475,7 +476,7 @@ def get_model(model_size: str = DEFAULT_MODEL):
         try:
             import whisper
         except ImportError as exc:
-            raise RuntimeError("找不到 faster-whisper 或 whisper，請先執行 install.bat / install.sh") from exc
+            raise RuntimeError("找不到 faster-whisper 或 whisper，請執行 start.bat / start.sh") from exc
 
         try:
             logger.info("載入 Whisper 模型: %s ...", model_size)
@@ -804,15 +805,20 @@ def list_models():
 if __name__ == "__main__":
     host = os.environ.get("WHISPER_HOST", "127.0.0.1")
     port = int(os.environ.get("WHISPER_PORT", "5000"))
+    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    url = f"http://{browser_host}:{port}"
 
     print("=" * 52)
     print("  Whisper Transcription System (faster-whisper)")
     print("=" * 52)
-    print(f"  URL: http://{host}:{port}")
+    print(f"  URL: {url}")
     print("  Press Ctrl+C to stop")
     print("=" * 52)
 
     if host != "127.0.0.1":
         logger.warning("服務綁定在 %s，區網內其他裝置可存取", host)
+
+    if os.environ.get("WHISPER_NO_BROWSER", "").strip() not in {"1", "true", "yes"}:
+        Timer(1.2, lambda: webbrowser.open(url)).start()
 
     app.run(host=host, port=port, debug=False, threaded=True)
