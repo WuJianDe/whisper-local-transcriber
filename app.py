@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 import re
 import shutil
@@ -24,7 +23,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 RETURN_ABSOLUTE_OUTPUT_DIR = False
 
 ALLOWED_EXTENSIONS = {"mp3", "wav", "m4a", "ogg", "flac", "webm", "mp4"}
-ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large"}
+ALLOWED_MODELS = {"tiny", "base", "small", "medium", "turbo", "large"}
 ALLOWED_LANGUAGES = {"auto", "zh", "en", "ja", "ko"}
 DEFAULT_MODEL = "small"
 DEFAULT_LANGUAGE = "zh"
@@ -36,18 +35,33 @@ MAX_FILENAME_STEM_LEN = 80
 JOB_RETENTION_SECONDS = 3600
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ACTIVE_STATES = {"requested", "processing", "cancel_requested"}
-CONTEXT_TAIL_CHARS = 200
+CONTEXT_TAIL_CHARS = 180
+DEFAULT_ZH_PROMPT = "以下是繁體中文的逐字稿，請使用台灣常見繁體字與全形標點符號。"
+HALLUCINATION_PHRASES = {
+    "謝謝觀看",
+    "感謝觀看",
+    "謝謝收看",
+    "感謝收看",
+    "請訂閱",
+    "字幕由",
+    "Amara.org",
+    "Subtitles by",
+}
 
 MODEL_CATALOG = [
     {"id": "tiny", "name": "Tiny", "size": "~75MB", "note": "最快，精度最低", "default": False, "enabled": True},
     {"id": "base", "name": "Base", "size": "~142MB", "note": "速度快，品質中等", "default": False, "enabled": True},
     {"id": "small", "name": "Small", "size": "~466MB", "note": "預設推薦，速度/精度平衡", "default": True, "enabled": True},
     {"id": "medium", "name": "Medium", "size": "~1.5GB", "note": "更高精度，較慢", "default": False, "enabled": True},
+    {"id": "turbo", "name": "Turbo (large-v3-turbo)", "size": "~1.5GB", "note": "極高性價比，接近 Large 精度但速度大幅提升", "default": False, "enabled": True},
     {"id": "large", "name": "Large", "size": "~3GB", "note": "最高精度，最慢", "default": False, "enabled": True},
 ]
 
 _model_cache = {}
 _model_lock = Lock()
+
+_opencc_converter = None
+_opencc_initialized = False
 
 _jobs = {}
 _jobs_lock = Lock()
@@ -112,6 +126,130 @@ def count_words(text: str) -> int:
     non_cjk = re.sub(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", " ", text)
     latin_words = len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", non_cjk))
     return cjk_chars + latin_words
+
+
+def to_traditional_zh(text: str) -> str:
+    global _opencc_converter, _opencc_initialized
+    if not text:
+        return text
+    if not _opencc_initialized:
+        _opencc_initialized = True
+        try:
+            from opencc import OpenCC
+
+            _opencc_converter = OpenCC("s2twp")
+        except Exception:
+            _opencc_converter = None
+    if _opencc_converter is not None:
+        try:
+            return _opencc_converter.convert(text)
+        except Exception:
+            return text
+    return text
+
+
+def build_effective_prompt(language: str, user_prompt: str, context_tail: str = "") -> str:
+    parts = []
+    if language == "zh" and not user_prompt:
+        parts.append(DEFAULT_ZH_PROMPT)
+    elif language == "zh" and user_prompt:
+        parts.append(f"{DEFAULT_ZH_PROMPT} {user_prompt}")
+    elif user_prompt:
+        parts.append(user_prompt)
+
+    if context_tail:
+        parts.append(context_tail[-CONTEXT_TAIL_CHARS:])
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def compute_silence_boundaries(
+    audio,
+    sample_rate: int,
+    chunk_seconds: float,
+    search_window_sec: float = 15.0,
+    frame_sec: float = 0.25,
+) -> list[tuple[int, int]]:
+    total_samples = len(audio)
+    if total_samples == 0:
+        return [(0, 0)]
+    target_chunk_samples = int(round(chunk_seconds * sample_rate))
+    if target_chunk_samples <= 0 or total_samples <= target_chunk_samples:
+        return [(0, total_samples)]
+
+    window_samples = int(round(search_window_sec * sample_rate))
+    frame_samples = max(1, int(round(frame_sec * sample_rate)))
+
+    boundaries = [0]
+    current = 0
+    while current + target_chunk_samples < total_samples:
+        ideal = current + target_chunk_samples
+        if total_samples - ideal <= window_samples:
+            break
+
+        search_start = max(current + frame_samples, ideal - window_samples)
+        search_end = min(total_samples - frame_samples, ideal + window_samples)
+
+        if search_end <= search_start + frame_samples:
+            best_idx = ideal
+        else:
+            best_idx = ideal
+            best_energy = float("inf")
+            for pos in range(search_start, search_end, frame_samples):
+                segment = audio[pos : pos + frame_samples]
+                if len(segment) == 0:
+                    continue
+                try:
+                    energy = float((segment * segment).mean())
+                except AttributeError:
+                    energy = sum(float(x) * float(x) for x in segment) / len(segment)
+                if energy < best_energy:
+                    best_energy = energy
+                    best_idx = pos + len(segment) // 2
+
+        boundaries.append(best_idx)
+        current = best_idx
+
+    boundaries.append(total_samples)
+    return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+
+def is_hallucination_or_duplicate(text: str, prev_text: str) -> bool:
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+    if prev_text and cleaned == prev_text.strip():
+        return True
+    if len(cleaned) <= 14 and any(phrase in cleaned for phrase in HALLUCINATION_PHRASES):
+        return True
+    return False
+
+
+def filter_and_normalize_segments(
+    raw_segments: list[dict],
+    chunk_start_sec: float,
+    language: str,
+) -> list[dict]:
+    normalized_list = []
+    prev_text = ""
+    convert_zh = language == "zh"
+
+    for seg in raw_segments:
+        text = (seg.get("text") or "").strip()
+        if convert_zh and text:
+            text = to_traditional_zh(text)
+        if is_hallucination_or_duplicate(text, prev_text):
+            continue
+        prev_text = text
+        rel_start = float(seg.get("start", 0.0))
+        rel_end = float(seg.get("end", rel_start))
+        normalized_list.append(
+            {
+                "start": round(chunk_start_sec + rel_start, 2),
+                "end": round(chunk_start_sec + rel_end, 2),
+                "text": text,
+            }
+        )
+    return normalized_list
 
 
 def save_chunk_txt(output_dir: Path, job_prefix: str, chunk_index: int, start_sec: float, end_sec: float, segments: list[dict]) -> str:
@@ -216,7 +354,13 @@ def release_job_slot() -> None:
         _active_jobs = max(0, _active_jobs - 1)
 
 
-def use_fp16() -> bool:
+def has_cuda_device() -> bool:
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        pass
     try:
         import torch
 
@@ -225,9 +369,83 @@ def use_fp16() -> bool:
         return False
 
 
+def use_fp16() -> bool:
+    return has_cuda_device()
+
+
 def job_is_active(job_id: str) -> bool:
     with _jobs_lock:
         return _jobs.get(job_id, {}).get("state") in ACTIVE_STATES
+
+
+def load_audio_16k(path: str):
+    """Loads audio at 16kHz mono float32 using faster_whisper (PyAV) or whisper.audio (ffmpeg)."""
+    try:
+        from faster_whisper.audio import decode_audio
+
+        return decode_audio(path, sampling_rate=16000)
+    except ImportError:
+        pass
+    try:
+        import whisper.audio
+
+        return whisper.audio.load_audio(path)
+    except ImportError as exc:
+        raise ImportError("無法載入音訊解碼器，請先執行 install.bat / install.sh 安裝 faster-whisper") from exc
+
+
+class FasterWhisperAdapter:
+    """Wraps faster_whisper.WhisperModel to provide a consistent .transcribe() interface
+    with per-segment cancellation check and built-in Silero VAD filtering."""
+
+    is_faster_whisper = True
+
+    def __init__(self, fw_model):
+        self._model = fw_model
+
+    def transcribe(self, audio_chunk, **kwargs):
+        job_id = kwargs.get("_job_id", "")
+        language = kwargs.get("language")
+        initial_prompt = kwargs.get("initial_prompt")
+        condition_on_prev = kwargs.get("condition_on_previous_text", False)
+        no_speech_threshold = kwargs.get("no_speech_threshold", 0.6)
+        log_prob_threshold = kwargs.get("logprob_threshold", -1.0)
+        compression_ratio_threshold = kwargs.get("compression_ratio_threshold", 2.4)
+
+        try:
+            import numpy as np
+
+            if not isinstance(audio_chunk, np.ndarray):
+                audio_chunk = np.asarray(audio_chunk, dtype=np.float32)
+        except Exception:
+            pass
+
+        segments_gen, info = self._model.transcribe(
+            audio_chunk,
+            language=language,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=condition_on_prev,
+            no_speech_threshold=no_speech_threshold,
+            log_prob_threshold=log_prob_threshold,
+            compression_ratio_threshold=compression_ratio_threshold,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+
+        collected = []
+        for seg in segments_gen:
+            if job_id and is_cancelled(job_id):
+                break
+            collected.append(
+                {
+                    "start": float(getattr(seg, "start", 0.0)),
+                    "end": float(getattr(seg, "end", 0.0)),
+                    "text": getattr(seg, "text", ""),
+                }
+            )
+
+        detected_lang = getattr(info, "language", None) or language or "unknown"
+        return {"language": detected_lang, "segments": collected}
 
 
 def get_model(model_size: str = DEFAULT_MODEL):
@@ -235,10 +453,29 @@ def get_model(model_size: str = DEFAULT_MODEL):
         if model_size in _model_cache:
             return _model_cache[model_size]
 
+        has_cuda = has_cuda_device()
+
+        try:
+            from faster_whisper import WhisperModel
+
+            device = "cuda" if has_cuda else "cpu"
+            compute_type = "float16" if has_cuda else "int8"
+            fw_model_name = "large-v3-turbo" if model_size == "turbo" else model_size
+            logger.info("載入 faster-whisper 模型: %s (device=%s, compute_type=%s) ...", fw_model_name, device, compute_type)
+            fw_model = WhisperModel(fw_model_name, device=device, compute_type=compute_type)
+            adapter = FasterWhisperAdapter(fw_model)
+            _model_cache[model_size] = adapter
+            logger.info("faster-whisper 模型載入完成: %s", fw_model_name)
+            return adapter
+        except ImportError:
+            pass
+        except Exception as exc:
+            raise RuntimeError(f"模型載入失敗: {model_size}") from exc
+
         try:
             import whisper
         except ImportError as exc:
-            raise RuntimeError("找不到 whisper，請先執行 install.bat / install.sh") from exc
+            raise RuntimeError("找不到 faster-whisper 或 whisper，請先執行 install.bat / install.sh") from exc
 
         try:
             logger.info("載入 Whisper 模型: %s ...", model_size)
@@ -375,10 +612,10 @@ def transcribe():
             tmp_path = tmp.name
 
         try:
-            import whisper.audio
+            audio = load_audio_16k(tmp_path)
         except ImportError:
             update_job(job_id, state="failed", error_code="TRANSCRIBER_UNAVAILABLE")
-            return error_response("TRANSCRIBER_UNAVAILABLE", "whisper.audio 無法載入，請重新安裝依賴", 500)
+            return error_response("TRANSCRIBER_UNAVAILABLE", "音訊解碼器無法載入，請重新安裝依賴", 500)
 
         try:
             model = get_model(model_size)
@@ -387,21 +624,30 @@ def transcribe():
             log_event(job_id, "model-load-fail", str(exc))
             return error_response("MODEL_LOAD_FAILED", "模型載入失敗，請查看伺服器日誌", 500)
 
-        options = {"fp16": use_fp16(), "verbose": False}
+        options = {
+            "fp16": use_fp16(),
+            "verbose": False,
+            "condition_on_previous_text": False,
+            "no_speech_threshold": 0.6,
+            "logprob_threshold": -1.0,
+            "compression_ratio_threshold": 2.4,
+        }
         if language != "auto":
             options["language"] = language
-        if initial_prompt:
-            options["initial_prompt"] = initial_prompt
 
         start_time = time.time()
-        audio = whisper.audio.load_audio(tmp_path)
         sample_rate = 16000
         total_seconds = len(audio) / sample_rate
 
         write_chunk_files = chunk_minutes < MAX_CHUNK_MINUTES
         chunk_seconds = (chunk_minutes * 60) if write_chunk_files else total_seconds
         chunk_seconds = max(float(chunk_seconds), 1.0)
-        total_chunks = max(1, math.ceil(total_seconds / chunk_seconds))
+
+        if write_chunk_files:
+            chunk_ranges = compute_silence_boundaries(audio, sample_rate, chunk_seconds)
+        else:
+            chunk_ranges = [(0, len(audio))]
+        total_chunks = max(1, len(chunk_ranges))
 
         log_event(job_id, "processing-start", f"audio_seconds={round(total_seconds, 1)}, total_chunks={total_chunks}")
         update_job(job_id, total_chunks=total_chunks, audio_seconds=round(total_seconds, 1), started_at=start_time)
@@ -415,51 +661,51 @@ def transcribe():
         word_count = 0
         context_tail = ""
 
-        for chunk_index in range(total_chunks):
+        for chunk_index, (start_idx, end_idx) in enumerate(chunk_ranges):
             if is_cancelled(job_id):
                 cancelled = True
                 update_job(job_id, state="cancelled")
                 log_event(job_id, "cancelled", f"cancelled before chunk {chunk_index + 1}")
                 break
 
-            chunk_start_sec = chunk_index * chunk_seconds
-            chunk_end_sec = min((chunk_index + 1) * chunk_seconds, total_seconds)
-            start_idx = int(chunk_start_sec * sample_rate)
-            end_idx = int(chunk_end_sec * sample_rate)
+            chunk_start_sec = start_idx / sample_rate
+            chunk_end_sec = end_idx / sample_rate
             chunk_audio = audio[start_idx:end_idx]
             if len(chunk_audio) == 0:
                 continue
 
             log_event(job_id, "chunk-start", f"{chunk_index + 1}/{total_chunks} {fmt_time(chunk_start_sec)}-{fmt_time(chunk_end_sec)}")
             chunk_options = dict(options)
-            prompt = " ".join(p for p in (initial_prompt, context_tail) if p)
-            if prompt:
-                chunk_options["initial_prompt"] = prompt
+            effective_prompt = build_effective_prompt(language, initial_prompt, context_tail)
+            if effective_prompt:
+                chunk_options["initial_prompt"] = effective_prompt
+            if getattr(model, "is_faster_whisper", False):
+                chunk_options["_job_id"] = job_id
+
             chunk_result = model.transcribe(chunk_audio, **chunk_options)
             log_event(job_id, "chunk-end", f"{chunk_index + 1}/{total_chunks}")
-            processed_chunks += 1
-            update_job(job_id, processed_chunks=processed_chunks, elapsed_seconds=round(time.time() - start_time, 1))
 
             if detected_language == "unknown":
                 detected_language = chunk_result.get("language", "unknown")
 
-            chunk_segments = []
-            for seg in chunk_result.get("segments", []):
-                text = seg.get("text", "").strip()
-                rel_start = float(seg.get("start", 0.0))
-                rel_end = float(seg.get("end", rel_start))
-                normalized = {
-                    "start": round(chunk_start_sec + rel_start, 2),
-                    "end": round(chunk_start_sec + rel_end, 2),
-                    "text": text,
-                }
-                chunk_segments.append(normalized)
+            effective_lang = detected_language if detected_language != "unknown" else language
+            chunk_segments = filter_and_normalize_segments(
+                raw_segments=chunk_result.get("segments", []),
+                chunk_start_sec=chunk_start_sec,
+                language=effective_lang,
+            )
+
+            for normalized in chunk_segments:
                 all_segments.append(normalized)
+                text = normalized["text"]
                 if text:
                     transcript_parts.append(text)
                     word_count += count_words(text)
 
-            if write_chunk_files:
+            processed_chunks += 1
+            update_job(job_id, processed_chunks=processed_chunks, elapsed_seconds=round(time.time() - start_time, 1), word_count=word_count)
+
+            if write_chunk_files and (chunk_segments or not is_cancelled(job_id)):
                 chunk_filename = save_chunk_txt(
                     output_dir=output_dir,
                     job_prefix=job_prefix,
@@ -470,9 +716,15 @@ def transcribe():
                 )
                 saved_files.append(chunk_filename)
                 log_event(job_id, "save", f"chunk_file={chunk_filename}")
+
             if chunk_segments:
                 context_tail = " ".join(s["text"] for s in chunk_segments if s["text"])[-CONTEXT_TAIL_CHARS:]
-            update_job(job_id, word_count=word_count)
+
+            if is_cancelled(job_id):
+                cancelled = True
+                update_job(job_id, state="cancelled")
+                log_event(job_id, "cancelled", f"cancelled during chunk {chunk_index + 1}")
+                break
 
         full_transcript = " ".join(transcript_parts).strip()
         elapsed = round(time.time() - start_time, 1)
@@ -554,14 +806,12 @@ if __name__ == "__main__":
     port = int(os.environ.get("WHISPER_PORT", "5000"))
 
     print("=" * 52)
-    print("  Whisper Transcription System")
+    print("  Whisper Transcription System (faster-whisper)")
     print("=" * 52)
     print(f"  URL: http://{host}:{port}")
     print("  Press Ctrl+C to stop")
     print("=" * 52)
 
-    if shutil.which("ffmpeg") is None:
-        logger.warning("找不到 ffmpeg，Whisper 無法解碼音訊，請先安裝 ffmpeg 並加入 PATH")
     if host != "127.0.0.1":
         logger.warning("服務綁定在 %s，區網內其他裝置可存取", host)
 

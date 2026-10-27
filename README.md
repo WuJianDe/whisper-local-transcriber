@@ -1,26 +1,26 @@
-# Whisper 本地轉錄系統
+# Whisper 本地轉錄系統 (faster-whisper 加速版)
 
-以 Flask + OpenAI Whisper 建立的本地語音轉文字工具，提供 Web 介面上傳音訊、即時進度查詢、可中止任務，並輸出完整稿與分段稿文字檔。
+以 Flask + `faster-whisper` (CTranslate2) 建立的本地語音轉文字工具，提供 Web 介面上傳音訊、即時進度查詢、秒級中止任務，並輸出完整稿與智慧靜音分段文字檔。完全免費、本地離線執行。
 
-## 系統功能
-- 本地 Web 介面：`GET /` 提供前端操作頁。
-- 僅允許 1 個並行任務。
-- 任務狀態保存 1 小時，逾時會清理。
-- 檔案大小上限 500MB。
-- 支援上傳格式：`mp3`、`wav`、`m4a`、`ogg`、`flac`、`webm`、`mp4`。
-- 允許模型：`tiny`、`base`、`small`、`medium`、`large`。
-- 允許語言：`auto`、`zh`、`en`、`ja`、`ko`。
-- 支援 `initial_prompt`（專有名詞提示）與 `chunk_minutes`（1..999）。
+## 系統特色與優化
+- **高速轉譯引擎 (`faster-whisper`)**：相較原版 Whisper 速度提升 4~6 倍、記憶體佔用減半（GPU 自動啟用 `float16`，CPU 自動啟用 `int8` 量化加速）。
+- **內建 Silero VAD 靜音過濾**：自動跳過無聲空白片段，大幅減少「謝謝觀看」等背景幻覺與重複鬼打牆。
+- **智慧靜音切段 (Silence-aware Chunking)**：在目標分段點前後自動尋找音量最低的換氣停頓點下刀，不切斷句子。
+- **繁體中文強化**：內建繁體中文標點引導詞，並整合 `OpenCC (s2twp)` 自動轉換簡體字與台灣慣用詞；跨分段自動銜接上下文提示。
+- **支援檔案與模型**：
+  - 上傳上限 500MB，支援 `mp3`、`wav`、`m4a`、`ogg`、`flac`、`webm`、`mp4`。
+  - 模型：`tiny`、`base`、`small`、`medium`、`turbo` (`large-v3-turbo`)、`large`。
+  - 語言：`auto`、`zh`、`en`、`ja`、`ko`。
 
 ## 必要環境
 
 - Python 3.10+
 - `pip`
-- 首次安裝需可連網（下載套件與模型）
+- 首次安裝與首次使用模型時需連網下載套件與模型權重
 
-安裝腳本會安裝：
-
-- `openai-whisper`
+安裝腳本會根據 `requirements.txt` 自動安裝：
+- `faster-whisper`
+- `opencc-python-reimplemented`
 - `flask`
 
 ## 安裝與啟動
@@ -40,11 +40,10 @@ chmod +x install.sh start.sh
 ./start.sh
 ```
 
-啟動後開啟：`http://localhost:5000`
+啟動後開啟：`http://127.0.0.1:5000`
 
 ## 補充行為
 
 - `chunk_minutes = 999` 時，不輸出分段檔，只輸出完整檔（或中止部分檔）。
-- 前端會每 3 秒輪詢 `/jobs/<job_id>` 即時更新進度與已辨識字數，並支援「停止辨識」、逐字稿複製與各分段檔案獨立下載（`GET /outputs/<filename>`）。
+- 前端每 3 秒輪詢 `/jobs/<job_id>` 即時更新進度與已辨識字數，並支援「停止辨識」（逐句即時中斷）、逐字稿複製與各分段檔案獨立下載（`GET /outputs/<filename>`）。
 - 預設僅綁定本機 `127.0.0.1:5000`，可透過環境變數 `WHISPER_HOST=0.0.0.0` 與 `WHISPER_PORT` 自訂。
-- 自動偵測 CUDA GPU 並啟用 `fp16` 加速；跨分段自動銜接前段結尾文字作為上下文提示。

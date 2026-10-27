@@ -384,6 +384,7 @@
           <option value="base">Base（快 / ~142MB）</option>
           <option value="small" selected>Small（推薦 / ~466MB）★</option>
           <option value="medium">Medium（慢 / ~1.5GB）</option>
+          <option value="turbo">Turbo（極速高準確率 / ~1.5GB）🔥</option>
           <option value="large">Large（最慢 / ~3GB）</option>
         </select>
         <div class="model-hint" id="modelHint">🎯 Small 模型：推薦使用，速度與準確率的最佳平衡點</div>
@@ -594,6 +595,7 @@
     base:   '⚡ Base：速度快，準確率良好，適合一般內容',
     small:  '🎯 Small：推薦使用，速度與準確率的最佳平衡點',
     medium: '🎯 Medium：準確率很高，適合重要內容，速度較慢',
+    turbo:  '🔥 Turbo (large-v3-turbo)：逼近 Large 的高準確率，但速度快上數倍（強烈推薦）',
     large:  '🏆 Large：最高準確率，適合專業用途，速度最慢',
   };
   modelSelect.addEventListener('change', () => {

@@ -12,32 +12,45 @@ def install_fake_whisper(monkeypatch, *, seconds=12.0, language="zh", segments=N
     if segments is None:
         segments = [{"start": 0.0, "end": 1.0, "text": "測試文字"}]
 
-    whisper_module = types.ModuleType("whisper")
-    audio_module = types.ModuleType("whisper.audio")
+    fw_module = types.ModuleType("faster_whisper")
+    fw_audio_module = types.ModuleType("faster_whisper.audio")
 
     sample_rate = 16000
     fake_audio = [0.0] * int(seconds * sample_rate)
 
-    def load_audio(_path):
+    def decode_audio(_path, sampling_rate=16000):
         return fake_audio
 
-    class FakeModel:
+    class FakeSegment:
+        def __init__(self, start, end, text):
+            self.start = start
+            self.end = end
+            self.text = text
+
+    class FakeInfo:
+        def __init__(self, lang):
+            self.language = lang
+
+    class FakeWhisperModel:
+        def __init__(self, model_name, device="cpu", compute_type="int8"):
+            self.model_name = model_name
+            self.device = device
+            self.compute_type = compute_type
+
         def transcribe(self, _audio_chunk, **kwargs):
             if capture_kwargs is not None:
                 capture_kwargs.append(kwargs)
             if fail_transcribe:
                 raise RuntimeError("secret backend detail")
-            return {"language": language, "segments": segments}
+            gen = (FakeSegment(s["start"], s["end"], s["text"]) for s in segments)
+            return gen, FakeInfo(language)
 
-    def load_model(_name):
-        return FakeModel()
+    fw_audio_module.decode_audio = decode_audio
+    fw_module.WhisperModel = FakeWhisperModel
+    fw_module.audio = fw_audio_module
 
-    audio_module.load_audio = load_audio
-    whisper_module.load_model = load_model
-    whisper_module.audio = audio_module
-
-    monkeypatch.setitem(sys.modules, "whisper", whisper_module)
-    monkeypatch.setitem(sys.modules, "whisper.audio", audio_module)
+    monkeypatch.setitem(sys.modules, "faster_whisper", fw_module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.audio", fw_audio_module)
 
 
 @pytest.fixture
@@ -78,6 +91,33 @@ def test_count_words_mixed_cjk_and_english():
     assert whisper_app.count_words("今天開會討論 AI agent 架構") == 9
 
 
+def test_compute_silence_boundaries_finds_quietest_point():
+    sr = 100
+    # 25 seconds of loud signal (1.0), except a quiet valley at 9.0s..9.5s (0.0)
+    audio = [1.0] * (25 * sr)
+    for i in range(int(9.0 * sr), int(9.5 * sr)):
+        audio[i] = 0.0
+
+    ranges = whisper_app.compute_silence_boundaries(audio, sr, chunk_seconds=10.0, search_window_sec=2.0, frame_sec=0.25)
+    assert len(ranges) >= 2
+    first_start, first_end = ranges[0]
+    assert first_start == 0
+    assert int(9.0 * sr) <= first_end <= int(9.5 * sr)
+
+
+def test_filter_and_normalize_segments_dedup_and_hallucination():
+    raw = [
+        {"start": 0.0, "end": 1.0, "text": "第一句正常內容"},
+        {"start": 1.0, "end": 2.0, "text": "第一句正常內容"},
+        {"start": 2.0, "end": 3.0, "text": "謝謝觀看"},
+        {"start": 3.0, "end": 4.0, "text": "第二句正常內容"},
+    ]
+    cleaned = whisper_app.filter_and_normalize_segments(raw, chunk_start_sec=10.0, language="zh")
+    assert [c["text"] for c in cleaned] == ["第一句正常內容", "第二句正常內容"]
+    assert cleaned[0]["start"] == 10.0
+    assert cleaned[1]["start"] == 13.0
+
+
 def test_build_job_prefix_format():
     prefix = whisper_app.build_job_prefix("../中文 檔案!!.mp3")
     assert re.match(r"^[A-Za-z0-9_-]+_\d{8}_\d{6}$", prefix)
@@ -94,15 +134,15 @@ def test_parse_chunk_minutes_bounds():
         whisper_app.parse_chunk_minutes("abc")
 
 
-def test_transcribe_success_schema(client, monkeypatch):
+def test_transcribe_success_schema_and_turbo_model(client, monkeypatch):
     install_fake_whisper(monkeypatch, seconds=8.0)
-    res = client.post("/transcribe", data=make_upload_data(), content_type="multipart/form-data")
+    res = client.post("/transcribe", data=make_upload_data(model="turbo"), content_type="multipart/form-data")
     assert res.status_code == 200
 
     payload = res.get_json()
     assert payload["ok"] is True
     assert payload["job"]["id"] == "job-test-001"
-    assert payload["job"]["model"] == "small"
+    assert payload["job"]["model"] == "turbo"
     assert isinstance(payload["metrics"]["elapsed_seconds"], float)
     assert payload["result"]["transcript"] != ""
     assert payload["artifacts"]["output_dir"] == "output"
@@ -110,7 +150,7 @@ def test_transcribe_success_schema(client, monkeypatch):
     assert any(re.search(r"_\d{8}_\d{6}_", name) for name in payload["artifacts"]["saved_files"])
 
 
-def test_transcribe_context_carryover(client, monkeypatch):
+def test_transcribe_context_carryover_and_vad(client, monkeypatch):
     captured = []
     install_fake_whisper(monkeypatch, seconds=130.0, capture_kwargs=captured)
     res = client.post(
@@ -119,8 +159,9 @@ def test_transcribe_context_carryover(client, monkeypatch):
         content_type="multipart/form-data",
     )
     assert res.status_code == 200
-    assert len(captured) == 3
-    assert captured[0]["initial_prompt"] == "專有名詞"
+    assert len(captured) >= 2
+    assert captured[0]["vad_filter"] is True
+    assert "專有名詞" in captured[0]["initial_prompt"]
     assert "測試文字" in captured[1]["initial_prompt"]
 
 

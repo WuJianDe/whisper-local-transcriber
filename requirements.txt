@@ -1,2 +1,3 @@
-openai-whisper
+faster-whisper
+opencc-python-reimplemented
 flask
