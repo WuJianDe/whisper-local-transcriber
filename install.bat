@@ -7,7 +7,7 @@ echo ======================================
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python not found.
-    echo Please install Python 3.8+ from https://www.python.org/downloads/
+    echo Please install Python 3.10+ from https://www.python.org/downloads/
     echo Make sure to check "Add Python to PATH" during installation.
     pause
     exit /b 1
@@ -31,7 +31,7 @@ python -m pip install --upgrade pip -q
 
 echo [*] Installing openai-whisper and flask...
 echo     (This may take a few minutes on first run)
-pip install openai-whisper flask
+pip install -r requirements.txt
 
 if errorlevel 1 (
     echo [ERROR] Installation failed.

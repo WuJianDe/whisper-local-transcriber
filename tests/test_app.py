@@ -8,7 +8,7 @@ import pytest
 import app as whisper_app
 
 
-def install_fake_whisper(monkeypatch, *, seconds=12.0, language="zh", segments=None, fail_transcribe=False):
+def install_fake_whisper(monkeypatch, *, seconds=12.0, language="zh", segments=None, fail_transcribe=False, capture_kwargs=None):
     if segments is None:
         segments = [{"start": 0.0, "end": 1.0, "text": "測試文字"}]
 
@@ -22,7 +22,9 @@ def install_fake_whisper(monkeypatch, *, seconds=12.0, language="zh", segments=N
         return fake_audio
 
     class FakeModel:
-        def transcribe(self, _audio_chunk, **_kwargs):
+        def transcribe(self, _audio_chunk, **kwargs):
+            if capture_kwargs is not None:
+                capture_kwargs.append(kwargs)
             if fail_transcribe:
                 raise RuntimeError("secret backend detail")
             return {"language": language, "segments": segments}
@@ -70,6 +72,12 @@ def test_allowed_file():
     assert not whisper_app.allowed_file("noext")
 
 
+def test_count_words_mixed_cjk_and_english():
+    assert whisper_app.count_words("測試文字") == 4
+    assert whisper_app.count_words("Hello world") == 2
+    assert whisper_app.count_words("今天開會討論 AI agent 架構") == 9
+
+
 def test_build_job_prefix_format():
     prefix = whisper_app.build_job_prefix("../中文 檔案!!.mp3")
     assert re.match(r"^[A-Za-z0-9_-]+_\d{8}_\d{6}$", prefix)
@@ -102,6 +110,20 @@ def test_transcribe_success_schema(client, monkeypatch):
     assert any(re.search(r"_\d{8}_\d{6}_", name) for name in payload["artifacts"]["saved_files"])
 
 
+def test_transcribe_context_carryover(client, monkeypatch):
+    captured = []
+    install_fake_whisper(monkeypatch, seconds=130.0, capture_kwargs=captured)
+    res = client.post(
+        "/transcribe",
+        data=make_upload_data(chunk_minutes="1", initial_prompt="專有名詞"),
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 200
+    assert len(captured) == 3
+    assert captured[0]["initial_prompt"] == "專有名詞"
+    assert "測試文字" in captured[1]["initial_prompt"]
+
+
 def test_transcribe_validation_errors(client):
     res = client.post("/transcribe", data={}, content_type="multipart/form-data")
     assert res.status_code == 400
@@ -118,6 +140,32 @@ def test_transcribe_validation_errors(client):
     bad_chunk = client.post("/transcribe", data=make_upload_data(chunk_minutes="0"), content_type="multipart/form-data")
     assert bad_chunk.status_code == 400
     assert bad_chunk.get_json()["error"]["code"] == "INVALID_CHUNK_MINUTES"
+
+    bad_job_id = client.post("/transcribe", data=make_upload_data(job_id="bad/job..id"), content_type="multipart/form-data")
+    assert bad_job_id.status_code == 400
+    assert bad_job_id.get_json()["error"]["code"] == "INVALID_JOB_ID"
+
+
+def test_transcribe_rejects_duplicate_active_job_id(client):
+    whisper_app.create_or_reset_job("dup-job", model="small", language="zh", filename="a.mp3")
+    whisper_app.update_job("dup-job", state="processing")
+
+    res = client.post("/transcribe", data=make_upload_data(job_id="dup-job"), content_type="multipart/form-data")
+    assert res.status_code == 409
+    assert res.get_json()["error"]["code"] == "JOB_ID_IN_USE"
+
+
+def test_download_output_file(client, monkeypatch):
+    install_fake_whisper(monkeypatch, seconds=8.0)
+    res = client.post("/transcribe", data=make_upload_data(), content_type="multipart/form-data")
+    saved = res.get_json()["artifacts"]["saved_files"][0]
+
+    dl = client.get(f"/outputs/{saved}")
+    assert dl.status_code == 200
+    assert "測試文字" in dl.get_data(as_text=True)
+
+    bad = client.get("/outputs/..%2Fapp.py")
+    assert bad.status_code == 400
 
 
 def test_cancel_endpoint(client):

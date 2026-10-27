@@ -1,5 +1,8 @@
+import logging
 import math
 import os
+import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -9,6 +12,9 @@ from threading import Lock
 
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("whisper-app")
 
 app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
@@ -28,6 +34,9 @@ MAX_CHUNK_MINUTES = 999
 MAX_CONCURRENT_JOBS = 1
 MAX_FILENAME_STEM_LEN = 80
 JOB_RETENTION_SECONDS = 3600
+JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ACTIVE_STATES = {"requested", "processing", "cancel_requested"}
+CONTEXT_TAIL_CHARS = 200
 
 MODEL_CATALOG = [
     {"id": "tiny", "name": "Tiny", "size": "~75MB", "note": "最快，精度最低", "default": False, "enabled": True},
@@ -48,7 +57,7 @@ _active_jobs_lock = Lock()
 
 
 def log_event(job_id: str, stage: str, message: str) -> None:
-    print(f"[{stage}] [job:{job_id}] {message}")
+    logger.info("[%s] [job:%s] %s", stage, job_id, message)
 
 
 def error_response(code: str, message: str, status: int = 400, details: dict | None = None):
@@ -96,6 +105,13 @@ def fmt_time(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}m{secs:02d}s"
+
+
+def count_words(text: str) -> int:
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    non_cjk = re.sub(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", " ", text)
+    latin_words = len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", non_cjk))
+    return cjk_chars + latin_words
 
 
 def save_chunk_txt(output_dir: Path, job_prefix: str, chunk_index: int, start_sec: float, end_sec: float, segments: list[dict]) -> str:
@@ -200,6 +216,20 @@ def release_job_slot() -> None:
         _active_jobs = max(0, _active_jobs - 1)
 
 
+def use_fp16() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def job_is_active(job_id: str) -> bool:
+    with _jobs_lock:
+        return _jobs.get(job_id, {}).get("state") in ACTIVE_STATES
+
+
 def get_model(model_size: str = DEFAULT_MODEL):
     with _model_lock:
         if model_size in _model_cache:
@@ -211,13 +241,13 @@ def get_model(model_size: str = DEFAULT_MODEL):
             raise RuntimeError("找不到 whisper，請先執行 install.bat / install.sh") from exc
 
         try:
-            print(f"[*] 載入 Whisper 模型: {model_size} ...")
+            logger.info("載入 Whisper 模型: %s ...", model_size)
             model = whisper.load_model(model_size)
         except Exception as exc:
             raise RuntimeError(f"模型載入失敗: {model_size}") from exc
 
         _model_cache[model_size] = model
-        print(f"[OK] 模型載入完成: {model_size}")
+        logger.info("模型載入完成: %s", model_size)
         return model
 
 
@@ -254,12 +284,19 @@ def get_job(job_id: str):
     if total_chunks > 0:
         progress_percent = round(min(100.0, (processed_chunks / total_chunks) * 100), 1)
 
+    started_at = snapshot.get("started_at")
+    state = snapshot.get("state", "requested")
+    if started_at and state in ACTIVE_STATES:
+        elapsed = round(max(0.0, time.time() - float(started_at)), 1)
+    else:
+        elapsed = round(float(snapshot.get("elapsed_seconds") or 0), 1)
+
     return jsonify(
         {
             "ok": True,
             "job": {
                 "id": job_id,
-                "state": snapshot.get("state", "requested"),
+                "state": state,
                 "cancel_requested": bool(snapshot.get("cancel_requested", False)),
                 "model": snapshot.get("model"),
                 "language": snapshot.get("language"),
@@ -268,7 +305,7 @@ def get_job(job_id: str):
                 "processed_chunks": processed_chunks,
                 "total_chunks": total_chunks,
                 "progress_percent": progress_percent,
-                "elapsed_seconds": round(float(snapshot.get("elapsed_seconds") or 0), 1),
+                "elapsed_seconds": elapsed,
                 "word_count": int(snapshot.get("word_count") or 0),
             },
         }
@@ -294,6 +331,10 @@ def transcribe():
     language = request.form.get("language", DEFAULT_LANGUAGE).strip().lower()
     initial_prompt = request.form.get("initial_prompt", "").strip()
     job_id = (request.form.get("job_id", "") or "").strip() or str(uuid.uuid4())
+    if not JOB_ID_PATTERN.match(job_id):
+        return error_response("INVALID_JOB_ID", "job_id 只允許英數、底線、連字號，最長 64 字", 400)
+    if job_is_active(job_id):
+        return error_response("JOB_ID_IN_USE", "job_id 已有進行中的任務", 409, {"job_id": job_id})
 
     if model_size not in ALLOWED_MODELS:
         return error_response("INVALID_MODEL", "model 不在允許清單", 400, {"allowed": sorted(ALLOWED_MODELS)})
@@ -316,7 +357,16 @@ def transcribe():
     job_prefix = build_job_prefix(file.filename)
 
     create_or_reset_job(job_id, model=model_size, language=language, filename=file.filename)
-    update_job(job_id, state="processing", chunk_minutes=chunk_minutes, processed_chunks=0, total_chunks=0, word_count=0, elapsed_seconds=0.0, job_prefix=job_prefix)
+    update_job(
+        job_id,
+        state="processing",
+        chunk_minutes=chunk_minutes,
+        processed_chunks=0,
+        total_chunks=0,
+        word_count=0,
+        elapsed_seconds=0.0,
+        job_prefix=job_prefix,
+    )
     log_event(job_id, "upload-start", f"file={file.filename}, model={model_size}, language={language}, chunk_minutes={chunk_minutes}")
 
     try:
@@ -337,7 +387,7 @@ def transcribe():
             log_event(job_id, "model-load-fail", str(exc))
             return error_response("MODEL_LOAD_FAILED", "模型載入失敗，請查看伺服器日誌", 500)
 
-        options = {"fp16": False, "verbose": False}
+        options = {"fp16": use_fp16(), "verbose": False}
         if language != "auto":
             options["language"] = language
         if initial_prompt:
@@ -362,6 +412,8 @@ def transcribe():
         detected_language = "unknown"
         cancelled = False
         processed_chunks = 0
+        word_count = 0
+        context_tail = ""
 
         for chunk_index in range(total_chunks):
             if is_cancelled(job_id):
@@ -379,7 +431,11 @@ def transcribe():
                 continue
 
             log_event(job_id, "chunk-start", f"{chunk_index + 1}/{total_chunks} {fmt_time(chunk_start_sec)}-{fmt_time(chunk_end_sec)}")
-            chunk_result = model.transcribe(chunk_audio, **options)
+            chunk_options = dict(options)
+            prompt = " ".join(p for p in (initial_prompt, context_tail) if p)
+            if prompt:
+                chunk_options["initial_prompt"] = prompt
+            chunk_result = model.transcribe(chunk_audio, **chunk_options)
             log_event(job_id, "chunk-end", f"{chunk_index + 1}/{total_chunks}")
             processed_chunks += 1
             update_job(job_id, processed_chunks=processed_chunks, elapsed_seconds=round(time.time() - start_time, 1))
@@ -401,6 +457,7 @@ def transcribe():
                 all_segments.append(normalized)
                 if text:
                     transcript_parts.append(text)
+                    word_count += count_words(text)
 
             if write_chunk_files:
                 chunk_filename = save_chunk_txt(
@@ -413,11 +470,12 @@ def transcribe():
                 )
                 saved_files.append(chunk_filename)
                 log_event(job_id, "save", f"chunk_file={chunk_filename}")
-            update_job(job_id, word_count=len(" ".join(transcript_parts).replace(" ", "")))
+            if chunk_segments:
+                context_tail = " ".join(s["text"] for s in chunk_segments if s["text"])[-CONTEXT_TAIL_CHARS:]
+            update_job(job_id, word_count=word_count)
 
         full_transcript = " ".join(transcript_parts).strip()
         elapsed = round(time.time() - start_time, 1)
-        word_count = len(full_transcript.replace(" ", ""))
 
         if cancelled:
             full_filename = f"{job_prefix}_已停止_部分逐字稿.txt"
@@ -472,17 +530,39 @@ def transcribe():
             os.unlink(tmp_path)
 
 
+@app.route("/outputs/<path:filename>", methods=["GET"])
+def download_output_file(filename: str):
+    if "/" in filename or "\\" in filename or ".." in filename or not filename.endswith(".txt"):
+        return error_response("INVALID_FILENAME", "不合法的檔案名稱", 400)
+    target = (OUTPUT_DIR / filename).resolve()
+    try:
+        target.relative_to(OUTPUT_DIR.resolve())
+    except ValueError:
+        return error_response("INVALID_FILENAME", "不合法的檔案路徑", 400)
+    if not target.is_file():
+        return error_response("FILE_NOT_FOUND", "找不到指定的輸出檔案", 404)
+    return send_from_directory(str(OUTPUT_DIR.resolve()), filename, as_attachment=True)
+
+
 @app.route("/models", methods=["GET"])
 def list_models():
     return jsonify({"ok": True, "models": MODEL_CATALOG})
 
 
 if __name__ == "__main__":
+    host = os.environ.get("WHISPER_HOST", "127.0.0.1")
+    port = int(os.environ.get("WHISPER_PORT", "5000"))
+
     print("=" * 52)
     print("  Whisper Transcription System")
     print("=" * 52)
-    print("  URL: http://localhost:5000")
+    print(f"  URL: http://{host}:{port}")
     print("  Press Ctrl+C to stop")
     print("=" * 52)
 
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    if shutil.which("ffmpeg") is None:
+        logger.warning("找不到 ffmpeg，Whisper 無法解碼音訊，請先安裝 ffmpeg 並加入 PATH")
+    if host != "127.0.0.1":
+        logger.warning("服務綁定在 %s，區網內其他裝置可存取", host)
+
+    app.run(host=host, port=port, debug=False, threaded=True)

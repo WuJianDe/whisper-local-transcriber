@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
@@ -199,7 +199,6 @@
       background: var(--bg);
       border-radius: 10px;
       padding: 14px 18px;
-      display: none;
       gap: 24px;
     }
     .live-counter.show { display: flex; }
@@ -309,8 +308,19 @@
       font-size: 0.82rem; font-family: var(--mono);
     }
     .saved-item-icon { font-size: 1rem; }
-    .saved-item-name { flex: 1; color: var(--text); }
+    .saved-item-name { flex: 1; color: var(--text); word-break: break-all; }
     .saved-item-full { color: var(--green); }
+    .saved-item-dl {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.74rem;
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+    .saved-item-dl:hover { border-color: var(--accent); background: rgba(108,143,255,0.1); }
 
     /* saved files */
     .empty-state {
@@ -708,6 +718,12 @@ ${currentTranscript}`;
     const total = Number(job.total_chunks || 0);
     const state = job.state || 'processing';
     const statusText = total > 0 ? `已完成 ${processed}/${total} 段` : '準備中...';
+    if (typeof job.word_count === 'number' && job.word_count > 0) {
+      liveWords.textContent = `${job.word_count} 字`;
+    }
+    if (typeof job.word_count === 'number' && job.word_count > 0) {
+      liveWords.textContent = `${job.word_count} 字`;
+    }
 
     if (state === 'cancel_requested') {
       setProgress(Math.max(pct, 95), '停止中...', '已送出停止請求，等待目前片段完成');
@@ -725,7 +741,7 @@ ${currentTranscript}`;
     stopJobPolling();
     pollInterval = setInterval(() => {
       refreshJobProgress(jobId).catch(() => {});
-    }, 10000);
+    }, 3000);
   }
 
   function createJobId() {
@@ -893,10 +909,18 @@ ${currentTranscript}`;
             const isFullVersion = fname.includes('完整逐字稿');
             const item = document.createElement('div');
             item.className = 'saved-item';
-            item.innerHTML = `
-              <span class="saved-item-icon">${isFullVersion ? '📄' : '📝'}</span>
-              <span class="saved-item-name ${isFullVersion ? 'saved-item-full' : ''}">${fname}</span>
-            `;
+            const icon = document.createElement('span');
+            icon.className = 'saved-item-icon';
+            icon.textContent = isFullVersion ? '📄' : '📝';
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'saved-item-name' + (isFullVersion ? ' saved-item-full' : '');
+            nameSpan.textContent = fname;
+            const dlLink = document.createElement('a');
+            dlLink.className = 'saved-item-dl';
+            dlLink.href = `/outputs/${encodeURIComponent(fname)}`;
+            dlLink.download = fname;
+            dlLink.textContent = '下載';
+            item.append(icon, nameSpan, dlLink);
             savedList.appendChild(item);
           });
           savedCard.classList.add('show');
@@ -944,7 +968,12 @@ ${currentTranscript}`;
     currentSegments.forEach(seg => {
       const row = document.createElement('div');
       row.className = 'segment-row';
-      row.innerHTML = `<div class="segment-time">${fmtTime(seg.start)} → ${fmtTime(seg.end)}</div><div>${seg.text}</div>`;
+      const timeDiv = document.createElement('div');
+      timeDiv.className = 'segment-time';
+      timeDiv.textContent = `${fmtTime(seg.start)} → ${fmtTime(seg.end)}`;
+      const textDiv = document.createElement('div');
+      textDiv.textContent = seg.text;
+      row.append(timeDiv, textDiv);
       segmentsView.appendChild(row);
     });
   }

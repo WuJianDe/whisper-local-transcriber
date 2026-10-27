@@ -5,7 +5,7 @@ echo "======================================"
 
 # 檢查 Python
 if ! command -v python3 &> /dev/null; then
-    echo "[✗] 找不到 Python3，請先安裝 Python 3.8+"
+    echo "[✗] 找不到 Python3，請先安裝 Python 3.10+"
     exit 1
 fi
 
@@ -20,7 +20,7 @@ source venv/bin/activate
 # 安裝套件
 echo "[*] 安裝必要套件（第一次需要幾分鐘）..."
 pip install --upgrade pip -q
-pip install openai-whisper flask -q
+pip install -r requirements.txt -q
 
 echo ""
 echo "[✓] 安裝完成！"
